@@ -18,6 +18,11 @@ Kimi-K3 单层 profiling 工具。在给定输入形状和并行策略后，该�
 
 本项目首先服务于 H20 上的性能研究，不以生成正确文本或部署线上服务为目标。
 
+核心原则是：**缩小模型规模，但不缩短 vLLM execution stack**。主 benchmark
+应尽量保留真实的 model runner、输入准备、forward context、cache 注册、分布式
+通信和模型 forward 路径。直接调用 `KimiDecoderLayer.forward` 的实验只能作为
+组件级诊断，不能作为单层端到端延迟或完整模型外推的主要数据。
+
 ## 2. 非目标
 
 - 不把单个任意层的时间直接乘以总层数；
@@ -26,6 +31,8 @@ Kimi-K3 单层 profiling 工具。在给定输入形状和并行策略后，该�
 - 不把 PyTorch Profiler 或 Nsys trace 中的耗时直接作为最终 benchmark 数字；
 - 不把原始 trace、模型权重、token 或服务器敏感信息提交到 Git；
 - 不在服务器上修改 tracked 文件。代码和配置从 GitHub 单向发布到服务器。
+- 不在主 benchmark 中手工伪造一套简化 metadata 后直接调用 decoder layer；
+- 不把 cache eviction buffer 等同于完整模型中的真实权重流式访问。
 
 ## 3. 已知硬件与实现约束
 
@@ -66,7 +73,14 @@ AttnRes block-write 状态和已有 block 数量。
 
 ## 5. 总体实施路线
 
-项目分为七个阶段。每个阶段通过验收后再进入下一阶段。
+项目按以下四级验收推进，内部仍拆成七个实施阶段：
+
+| 验收级别 | 目标 | 对应阶段 |
+|---|---|---|
+| A：能运行 | 单层真实维度可初始化并完成 prefill/decode | 0-1 |
+| B：层正确 | 逻辑层类型、AttnRes 状态和 backend 正确 | 2-4 |
+| C：负载稳定 | shape、routing、rank 和计时可复现 | 5 |
+| D：可解释外推 | 多层校准后才能估算完整模型 | 6 |
 
 ### 阶段 0：环境和硬件基线
 
@@ -115,6 +129,14 @@ nsys --version
 - 单层参数、KV/KDA state 和通信 buffer 占用多少显存；
 - TP8 和 EP8 是否可以正常初始化。
 
+`--load-format dummy` 只解决“不下载完整 checkpoint”，不能自动证明执行形态
+等价于真实 MXFP4 checkpoint。smoke test 还必须逐 rank 验证：
+
+- 权重加载后最终的 storage、shape 和 dtype；
+- 实际选择的 MXFP4 MoE backend 和 fallback 原因；
+- 每个 rank 的权重显存；
+- 首次稳定迭代中实际出现的关键 kernel 名称。
+
 这一阶段的时间不能用于完整模型外推，因为它只代表物理第 0 层。
 
 验收标准：dummy 单层可以完成至少一次 prefill 和一次 decode，所有 rank 正常退出。
@@ -128,7 +150,11 @@ benchmarks/kimi_k3_layer_profiling/
 ├── README.md
 ├── benchmark.py
 ├── config.py
+├── workload.py
+├── layer_factory.py
 ├── runner.py
+├── timing.py
+├── profiling.py
 ├── result.py
 └── shapes/
     ├── smoke.yaml
@@ -141,7 +167,13 @@ benchmarks/kimi_k3_layer_profiling/
 
 - `benchmark.py`：命令行入口、分布式启动和实验循环；
 - `config.py`：读取 YAML、校验 shape 和并行策略；
-- `runner.py`：构造单层、输入、cache、forward context 和 profiler；
+- `workload.py`：把实验 shape 转换为 vLLM 可消费的请求和调度输入；
+- `layer_factory.py`：构造只含目标层的 `KimiLinearModel`，并注入 benchmark
+  专用逻辑层描述；
+- `runner.py`：复用真实 vLLM model runner 完成输入准备、forward context、
+  cache metadata 和模型 forward，不自行实现简化执行栈；
+- `timing.py`：warmup、CUDA event、同步和各 rank latency 汇总；
+- `profiling.py`：控制 PyTorch Profiler、Nsys capture range 和 Proton；
 - `result.py`：汇总各 rank 数据并写出 JSON/Markdown；
 - `shapes/*.yaml`：可复现实验配置。
 
@@ -186,27 +218,27 @@ vllm/models/kimi_k3/nvidia/model.py
 
 拟议修改：
 
-1. `KimiDecoderLayer` 接受可选的 `logical_layer_idx`；
+1. benchmark 专用 factory 向单层模型传入可选的 `logical_layer_idx`；
 2. 未指定时继续从 `prefix` 解析层号，保证正常模型行为不变；
 3. profiling 模式下只构造一个物理层，但使用指定逻辑层号判断层类型；
-4. 按逻辑层号构造 AttnRes block bank；
+4. 将“目标层身份”和“进入该层前的 AttnRes 状态”作为两个独立输入；
 5. cache layer name 保持物理单层命名，避免为不存在的层分配 cache；
-6. 通过私有、仅 benchmark 使用的配置传入逻辑层号，不增加正式 serving CLI。
+6. 不增加正式 serving CLI，生产路径在未传 profiling 配置时完全不变。
 
-可能使用的私有字段示例：
+benchmark 内部配置示例：
 
 ```python
-hf_overrides = {
-    "text_config": {
-        "num_hidden_layers": 1,
-        "_vllm_profile_logical_layer_idx": 30,
-    }
-}
+KimiLayerProfilingConfig(
+    logical_layer_idx=30,
+    incoming_attn_res_blocks=synthetic_blocks,
+    incoming_attn_res_prefix_sum=synthetic_prefix_sum,
+)
 ```
 
-在实现前必须再次检查模型架构配置和 cache 注册逻辑。若私有 HF override 会造成
-配置语义混乱，则改由 benchmark 专用 model subclass 或 factory 实现，不强行加入
-生产配置。
+该对象属于 benchmark/factory，不写入 Hugging Face model config。逻辑层号负责
+选择 KDA/MLA、MoE/dense、block-write 等结构；合成的入站状态负责复现深层
+AttnRes 的读取成本。二者不能混为“按层号自动构造一些零张量”。物理 prefix 仍为
+`model.layers.0`，以保持 cache 和静态 forward context 的注册一致。
 
 验收标准：能够分别构造 KDA 和 MLA 代表层，且层分类与完整 K3 config 一致。
 
@@ -234,8 +266,10 @@ tests/models/kimi_k3/test_layer_profiling.py
 - [ ] 指定 MLA 逻辑层时构造正确 attention；
 - [ ] MoE/dense 分类与完整 config 一致；
 - [ ] AttnRes block 数与逻辑层位置一致；
+- [ ] 合成 AttnRes 入站状态的 shape、dtype、device 和真实小模型一致；
 - [ ] 单层模式没有创建其他 decoder layer 参数；
 - [ ] tiny config 下，isolated layer 与小型完整模型对应层输出一致；
+- [ ] 主 benchmark 确实经过 model runner 输入准备和 forward context；
 - [ ] TP/EP 下所有 rank tensor shape 一致。
 
 测试命令必须通过 `.venv/bin/python` 运行：
@@ -282,6 +316,9 @@ Perfetto 查看。正式计时时关闭 stack、shape 和 memory recording。
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
+可使用仓库内的 `tools/profiler/nsys_profile_tools/gputrc2graph.py` 将 Nsys GPU
+trace 转换为便于分析的图结构；原始 `.nsys-rep` 和导出的数据库仍不提交 Git。
+
 #### Triton Proton
 
 用于查看 Triton 聚合调用树。Proton 要求 eager execution，不能用它得出 CUDA
@@ -292,6 +329,14 @@ Graph 模式的最终性能结论。
 先通过 Nsys 找到最重的 1 至 3 个 kernel，再用 NCU 分析 occupancy、HBM/L2
 带宽、Tensor Core 利用率、warp stall 和 roofline。不要直接用 NCU profile 整个
 服务进程。
+
+分析报告按组件归因，而不是只罗列 kernel：
+
+- KDA/MLA：projection、prefill/decode attention、cache/state 读写；
+- MoE：routing、dispatch/all-to-all、expert GEMM、combine；
+- 公共路径：norm、AttnRes read/write、collective、CPU launch 和 GPU idle。
+
+组件耗时来自 profiler，端到端延迟来自独立计时；二者允许因并发重叠而不相加。
 
 ### 阶段 6：完整模型估算和校准
 
@@ -318,16 +363,25 @@ T_model_step ≈
 - 用纯 prefill 与纯 decode 线性预测 mixed batch；
 - 用单层实验预测 pipeline parallel bubble。
 
-每个 shape 同时报告：
+每个 shape 至少区分：
 
-- `hot-cache`：同一层连续执行；
-- `cold/streaming-cache`：使用 L2 eviction buffer 或轮换多组权重；
+- `hot-layer`：同一层连续执行，权重和 metadata 具有较强复用；
+- `cache-perturbed-layer`：使用 L2 eviction buffer 或轮换多组权重，作为缓存
+  敏感性实验，不宣称它等价于完整模型流式执行；
+- `multi-layer-calibrated`：以真实多层运行测得的校准系数修正单层外推；
 - `uniform routing`；
 - 至少一种 skewed routing。
 
-使用一个能放入服务器的 4 至 8 层 tiny/dummy K3 模型做校准：先由单层数据预测
-该模型，再和真实 4 至 8 层端到端结果比较。达到预先设定的误差目标后，才外推
-完整模型。
+校准分成两个目的不同的实验：
+
+1. 使用显存允许的最多连续层（目标 4 至 8 层）、真实 hidden size 的 dummy K3，
+   校准权重/cache locality、kernel 调度和通信重叠；若不足 4 层，必须记录实际
+   层数并扩大外推误差范围；
+2. 使用至少跨越一个 AttnRes block 边界的小模型，必要时缩小 hidden size，校准
+   block bank 的创建、读取和 block-write 结构。
+
+先由单层数据预测校准模型，再与其真实端到端结果比较；达到预先设定的误差目标
+后，才外推完整模型。
 
 ## 6. 输入形状定义
 
@@ -361,6 +415,24 @@ M ≈ B × Q
 
 MLA cache 访问随 context length 变化，因此 decode 实验必须记录和扫描 `K`。
 
+第一版固定使用以下 canonical shapes，先建立可复现基线，再扩展不等长、mixed 和
+speculative workload：
+
+| ID | Phase | B | 每请求 Q | 每请求 K | M |
+|---|---|---:|---:|---:|---:|
+| P1 | prefill | 1 | 128 | 128 | 128 |
+| P2 | prefill | 1 | 2048 | 2048 | 2048 |
+| P3 | prefill | 8 | 256 | 256 | 2048 |
+| P4 | prefill | 32 | 64 | 64 | 2048 |
+| D1 | decode | 1 | 1 | 2048 | 1 |
+| D2 | decode | 32 | 1 | 2048 | 32 |
+| D3 | decode | 128 | 1 | 2048 | 128 |
+| D4 | decode | 32 | 1 | 32768 | 32 |
+| D5 | decode | 32 | 1 | 131072 | 32 |
+
+若某个 context 超过当前 cache 配额，结果应标记为 unsupported/OOM，而不是静默
+缩短 `K`。
+
 ### 切换边界
 
 K3 部分实现以 token 数 256 为路径切换阈值。目标 shape 附近至少补测：
@@ -382,6 +454,9 @@ M = 255, 256, 257
 | 2 | 4 | 8 | 每个 DP group 内 TP2 | EP8 |
 | 1 | 8 | 8 | attention 按 DP 复制 | EP8 |
 
+第一轮只运行 `TP=8, DP=1, EP=8, DCP=1, PP=1`，先稳定 execution stack、
+shape 和采集流程；通过验收后再展开矩阵。
+
 第一轮固定 `PP=1`。单层实验不能测量真实 pipeline bubble。
 
 DCP 子矩阵根据 TP 约束选择，例如：
@@ -394,6 +469,17 @@ TP2: DCP 1, 2
 
 第一轮 EP 使用默认 `allgather_reducescatter` backend。基础功能和数据可信后，
 再安装和比较 DeepEP/DeepGEMM 等可选组件。
+
+EP 不是一个可以脱离 TP/DP 单独相乘的抽象数字。vLLM 的 expert-parallel group
+由实际并行布局共同决定，因此 manifest 必须保存每个 rank 的 TP、DP、EP、DCP
+group 成员，以及该 rank 的 local expert 数量和 expert ID；不能只记录四个 size。
+
+逻辑层采样至少覆盖：第一个有效层、AttnRes 周期 `R` 附近、`4R` 附近和最后
+一层，并保证 KDA/MLA、MoE/dense 与 block-write 分类均被覆盖。最终分桶键至少为：
+
+```text
+(attention_type, ffn_type, attn_res_depth, block_write)
+```
 
 ## 8. MoE routing 策略
 
@@ -469,8 +555,15 @@ nccl_version: null
 dtype: bfloat16
 weight_format: mxfp4
 selected_backends: {}
+weight_storage_by_rank: []
+kernel_names: []
+physical_layer_index: 0
 logical_layer_index: null
 layer_type: null
+attention_type: null
+ffn_type: null
+attn_res_depth: null
+attn_res_block_write: null
 phase: null
 batch_size: null
 query_lengths: []
@@ -480,6 +573,8 @@ tensor_parallel_size: null
 data_parallel_size: null
 expert_parallel_size: null
 decode_context_parallel_size: null
+rank_groups: {}
+local_expert_ids_by_rank: {}
 all2all_backend: null
 execution_mode: eager
 routing_strategy: null
@@ -487,6 +582,8 @@ cache_mode: null
 warmup_iters: null
 repeat_iters: null
 random_seed: 0
+latency_ms_by_rank: []
+distributed_latency_ms: null
 ```
 
 ## 11. 每次实验的检查清单
@@ -498,7 +595,9 @@ random_seed: 0
 - [ ] 没有其他进程占用 GPU；
 - [ ] GPU clocks、power state 和温度稳定；
 - [ ] 8 个 rank 使用预期 GPU；
+- [ ] 各 rank 的 TP/DP/EP/DCP group 和 local experts 符合预期；
 - [ ] backend 日志与 manifest 一致；
+- [ ] dummy 权重的最终 storage/dtype 与选定 backend 已验证；
 - [ ] kernel JIT、autotune 和 graph capture 不计入正式时间。
 
 运行后：
@@ -508,7 +607,8 @@ random_seed: 0
 - [ ] 记录峰值显存；
 - [ ] 记录异常值和失败次数；
 - [ ] trace 只包含少量稳定 iteration；
-- [ ] summary 中明确 hot/cold cache、routing 和 eager/graph；
+- [ ] summary 中明确 hot-layer/cache-perturbed/multi-layer-calibrated、routing
+  和 eager/graph；
 - [ ] 结果目录包含完整 manifest。
 
 ## 12. 当前里程碑
@@ -528,7 +628,7 @@ random_seed: 0
 - [ ] 实现 logical layer profiling；
 - [ ] 完成正确性测试；
 - [ ] 完成 TP8/EP8 首轮数据；
-- [ ] 完成 4 至 8 层校准；
+- [ ] 完成显存允许的最大连续多层校准（目标 4 至 8 层）；
 - [ ] 形成完整 profiling 报告。
 
 ## 13. 工作原则
