@@ -1,27 +1,32 @@
-# Kimi-K3 单层 Profiling 工作文档
+# Kimi-K3 首个 AttnRes Block Profiling 工作文档
 
 ## 1. 背景与目标
 
 目标硬件为单机 8 张 NVIDIA H20，每张显存 96 GiB。GPU 之间通过完整的
 NVLink 域互联。服务器运行 Ubuntu 22.04，当前 CUDA Toolkit 为 13.0。
 
-完整 Kimi-K3 无法放入该服务器，因此本项目不尝试启动完整模型，而是构建一个
-Kimi-K3 单层 profiling 工具。在给定输入形状和并行策略后，该工具应当能够：
+完整 Kimi-K3 无法放入该服务器，因此本项目不尝试启动完整模型。主 benchmark
+运行首个真实尺寸的完整 AttnRes block；当前 Kimi-K3 配置中一个 block 为逻辑层
+0 至 11，共 12 个连续 decoder layers。当前阶段只把这个 block 的 profiling 流程
+完整走通；单层模式、中间/末端 block 和完整模型外推均延后决策。在给定输入形状
+和并行策略后，该工具应当能够：
 
-- 只在 GPU 上构造一个有代表性的 Kimi-K3 decoder layer；
+- 优先在 GPU 上构造逻辑层 0 至 11 的首个完整 AttnRes block；
+- 当 12 层受初始化峰值或 cache 限制无法运行时停止并重新评审，不把部分 block
+  静默当作完整 block；
 - 保留真实 hidden size、attention、MoE、量化和通信行为；
 - 分别测量 prefill、decode、chunked prefill 和 mixed batch；
 - 支持 TP、DP、EP 和 DCP 的组合；
-- 输出单层延迟、各 rank 延迟、显存和 profiler trace；
-- 按 KDA、MLA、MoE/dense 和 AttnRes 深度对层分类；
-- 使用多类代表层估算完整模型的执行时间，并明确误差来源。
+- 输出 block 延迟、各 rank 延迟、显存和 profiler trace；
+- 按 KDA、MLA、MoE 和 AttnRes 对 block 内开销进行 profiler 归因；
+- 形成可复现的首个 block 性能报告，并明确它不能代表完整模型。
 
 本项目首先服务于 H20 上的性能研究，不以生成正确文本或部署线上服务为目标。
 
 核心原则是：**缩小模型规模，但不缩短 vLLM execution stack**。主 benchmark
 应尽量保留真实的 model runner、输入准备、forward context、cache 注册、分布式
-通信和模型 forward 路径。直接调用 `KimiDecoderLayer.forward` 的实验只能作为
-组件级诊断，不能作为单层端到端延迟或完整模型外推的主要数据。
+通信和模型 forward 路径。当前阶段不实现直接调用 `KimiDecoderLayer.forward`
+的单层 benchmark。
 
 ## 2. 非目标
 
@@ -33,6 +38,12 @@ Kimi-K3 单层 profiling 工具。在给定输入形状和并行策略后，该�
 - 不在服务器上修改 tracked 文件。代码和配置从 GitHub 单向发布到服务器。
 - 不在主 benchmark 中手工伪造一套简化 metadata 后直接调用 decoder layer；
 - 不把 cache eviction buffer 等同于完整模型中的真实权重流式访问。
+- 不实现 token-smoke，不要求输出 token 或文字；
+- 当前工具不加载 embedding、LM head、vision tower、tokenizer 或 sampler；
+- 不把 embedding、LM head、scheduler 和 sampling 时间混入 block 延迟。
+- 当前阶段不实现任意逻辑层或任意逻辑 block；
+- 当前阶段不根据首个 block 外推 93 层 decoder 或完整服务延迟；
+- 当前阶段不承诺实现单层 profiling，是否需要由首个 block 报告决定。
 
 ## 3. 已知硬件与实现约束
 
@@ -49,7 +60,7 @@ H20 属于 Hopper，CUDA compute capability 为 9.0。当前 Kimi-K3 NVIDIA
 因此，本项目测量的是 Kimi-K3 在 H20 实际可运行 backend 上的性能，不能直接与
 B200、GB200 或 GB300 的结果比较。
 
-## 4. 为什么不能只保留普通的第 0 层
+## 4. 为什么先只做首个 Block
 
 Kimi-K3 decoder layer 不是完全同构的。至少需要区分：
 
@@ -60,16 +71,39 @@ Kimi-K3 decoder layer 不是完全同构的。至少需要区分：
 - AttnRes block-write layer；
 - 不同 AttnRes 历史 block 深度的 layer。
 
-另外，物理上只构造一层时，该层在 vLLM 中通常会成为 `model.layers.0`。但是我们
-可能希望它表现为完整模型中的第 30 层或第 60 层。因此必须区分：
+首个 12 层 block 能自然保留连续层、AttnRes 累积和 block-write，而且可直接使用
+逻辑层 0 至 11，避免第一版就引入逻辑 offset 和合成历史 AttnRes state。先完成
+一个 block 的全流程，更容易判断显存、execution stack、backend 和 profiler 是否
+可行。首个 block 不能代表模型中后部更深的 AttnRes 历史，因此当前报告只描述
+这个 block，不做完整模型外推。
+
+首个 block 的物理层号和逻辑层号暂时一一对应：
 
 ```text
-physical_layer_idx = 0
-logical_layer_idx  = 完整 Kimi-K3 中的真实层号
+physical_layer_idx = 0..11
+logical_layer_idx  = 0..11
 ```
 
-物理层号用于模块名和 cache 注册；逻辑层号用于确定 KDA/MLA、MoE/dense、
-AttnRes block-write 状态和已有 block 数量。
+只有未来扩展到中间/末端 block 时，才需要把物理层号和逻辑层号解耦，并注入
+历史 AttnRes state。该扩展不属于当前阶段。
+
+benchmark 的 I/O 固定为 packed synthetic hidden states，不经过 token 接口：
+
+```text
+[M, 7168] BF16 hidden states
+    -> Kimi 逻辑层 0..11
+    -> (pending_hidden_states, prefix_sum, block_residual_bank)
+```
+
+这里不能调用截断 `KimiLinearModel` 的模型末端 `output_attn_res` 聚合。完整模型中
+第 11 层之后仍要把上述三类状态传给第 12 层，而不是提前生成最终 hidden states。
+输出验证 shape、dtype、device、有限值、cache/state 更新和 rank 一致性，不验证
+生成文本质量。
+
+本项目使用 dummy weights，因此“实测 Kimi-K3 block”特指真实 shape、MXFP4
+物理表示、H20 backend、TP8/EP8 通信和 vLLM execution stack；不代表真实
+checkpoint 的 router、激活值或生成质量。报告统一标记为
+`shape-faithful/backend-faithful block profiling`。
 
 ## 5. 总体实施路线
 
@@ -77,10 +111,47 @@ AttnRes block-write 状态和已有 block 数量。
 
 | 验收级别 | 目标 | 对应阶段 |
 |---|---|---|
-| A：能运行 | 单层真实维度可初始化并完成 prefill/decode | 0-1 |
-| B：层正确 | 逻辑层类型、AttnRes 状态和 backend 正确 | 2-4 |
+| A：能运行 | 首个 12 层 block 可初始化并 forward | 0-1 |
+| B：结构正确 | block 边界、层类型、AttnRes 状态和 backend 正确 | 2-4 |
 | C：负载稳定 | shape、routing、rank 和计时可复现 | 5 |
-| D：可解释外推 | 多层校准后才能估算完整模型 | 6 |
+| D：形成报告 | 得到首个 block 的可复现性能结论和限制 | 6 |
+
+### 验证执行策略：本地优先、严格串行
+
+服务器只能从 GitHub 拉取代码，因此尽量在本地消除错误，减少无效的
+`commit -> push -> server pull` 循环。每个阶段严格按以下顺序执行：
+
+```text
+实现一个最小步骤
+    -> 本地可执行验证
+    -> 本地验证全部通过
+    -> 提交并推送该步骤
+    -> 仅在确有 GPU 依赖时由服务器拉取
+    -> H20 验证并保存证据
+    -> 当前步骤验收通过
+    -> 才进入下一步骤
+```
+
+任何验证失败时都停留在当前步骤。修复后从该步骤的本地验证重新开始，不跳过
+失败项，也不把多个未经服务器验证的 GPU 相关改动堆入同一次发布。
+
+验证位置按依赖划分：
+
+| 验证内容 | 默认位置 | 原因 |
+|---|---|---|
+| 配置解析、CLI、dry-run、manifest schema | 本地 | 不依赖 GPU |
+| 逻辑层/block 分类、范围和 AttnRes 深度计算 | 本地 | 可由 config 和纯 Python 验证 |
+| tiny config parity、CPU 单元测试 | 本地 | 成本低，反馈快 |
+| import、lint、类型和文档检查 | 本地 | 不应占用服务器 |
+| CUDA 单元测试 | 本地有兼容 NVIDIA GPU时优先本地，否则服务器 | 依赖 CUDA/backend |
+| H20 MXFP4/KDA/MLA backend | 服务器 | 依赖 SM90 和服务器安装环境 |
+| TP8/EP8/NCCL、逐 rank experts | 服务器 | 依赖 8 GPU 拓扑 |
+| 1/4/8/12 层峰值显存 | 服务器 | 依赖 8×H20 96 GiB |
+| Nsys/NCU 和最终性能数据 | 服务器 | 必须测目标硬件 |
+
+每一步的验证记录至少包含：Git commit、验证位置、命令、退出码、关键输出、
+通过/失败结论。服务器结果写入对应 manifest；本地测试结果记录在提交说明或阶段
+验收记录中。
 
 ### 阶段 0：环境和硬件基线
 
@@ -91,7 +162,8 @@ AttnRes block-write 状态和已有 block 数量。
 - [ ] 使用 CUDA 13.0 对应的预编译 wheel 安装 editable vLLM；
 - [ ] 确认当前导入的 `vllm` 来自本仓库；
 - [ ] 确认 PyTorch NCCL 可用；
-- [ ] 确认能够读取 `moonshotai/Kimi-K3` 配置；
+- [ ] 在本目录提交经过核对的 Kimi-K3 config-only 快照；
+- [ ] 服务器从本地 Git 工作区读取 config，不访问 Hugging Face；
 - [ ] 保存 `vllm collect-env` 输出；
 - [ ] 确认 Nsys 是否可用。
 
@@ -106,28 +178,83 @@ nvcc --version
 
 .venv/bin/python -c 'import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.device_count()); print(torch.cuda.get_device_name(0)); print(torch.cuda.get_device_capability(0)); print(torch.cuda.nccl.version())'
 .venv/bin/python -c 'import vllm; print(vllm.__version__); print(vllm.__file__)'
+.venv/bin/python -c 'from vllm.transformers_utils.config import get_config; c=get_config("benchmarks/kimi_k3_layer_profiling/model_config", False); t=c.text_config; print(t.num_hidden_layers, t.attn_res_block_size, t.hidden_size, t.num_experts)'
 vllm collect-env
 nsys --version
 ```
 
-验收标准：所有基础检查成功，且没有安装或启用不必要的 CPU offload。
+#### 阶段 0 验证
 
-### 阶段 1：不修改模型代码的单层启动实验
+验证位置：服务器（硬件与运行环境基线无法由本地替代）。
+
+1. 将以上命令的完整输出保存到 `profile_outputs/<commit>/env/`；
+2. 确认 `torch.cuda.device_count() == 8`，每张卡名称包含 `H20`，capability 为
+   `(9, 0)`；
+3. 确认当前分支和 commit 与 GitHub 发布版本一致；
+4. 运行一个 8 rank NCCL all-reduce smoke，确认所有 rank 正常退出；
+5. 确认本地 config 输出为 93 层、AttnRes block size 12、hidden size 7168、
+   896 experts；
+6. 确认没有启用 CPU offload。
+
+通过标准：六项全部满足。失败时停止模型实验，不带着环境问题进入阶段 1。
+
+### 阶段 1：12 层 Block 显存可行性
 
 先使用 vLLM 已有能力验证最小方案：
 
 - `--language-model-only` 排除视觉模型；
 - `--load-format dummy` 避免下载完整权重；
-- `--hf-overrides` 将 text model 缩短为一层；
+- `--skip-tokenizer-init` 避免初始化和访问 tokenizer；
+- `--hf-overrides` 先将 text model 缩短为 1 层，再测试 12 层；
 - `--enforce-eager` 简化首次调试；
 - 降低 `max_model_len`、`max_num_seqs` 和 KV cache 占用。
 
-这一阶段只回答以下问题：
+按 `1 -> 4 -> 8 -> 12` 层逐步增加，不直接从 1 跳到 12。1/4/8 层只用于定位
+初始化失败和控制显存风险，不进入正式 profiling 数据集。每次固定：
 
-- 一层真实维度的 Kimi-K3 是否能在 8 张 H20 上构造；
+```text
+TP=8, DP=1, EP=8, DCP=1, PP=1
+language-model-only, dummy weights, eager
+```
+
+阶段 1 使用现有 `vllm bench latency` 只做加载可行性检查。以下是 12 层命令；
+1/4/8 层仅修改 `num_hidden_layers`：
+
+```bash
+export VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random
+
+vllm bench latency \
+  --model benchmarks/kimi_k3_layer_profiling/model_config \
+  --skip-tokenizer-init \
+  --language-model-only \
+  --load-format dummy \
+  --hf-overrides '{"text_config":{"num_hidden_layers":12}}' \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --all2all-backend allgather_reducescatter \
+  --decode-context-parallel-size 1 \
+  --enforce-eager \
+  --max-model-len 2048 \
+  --max-num-batched-tokens 2048 \
+  --kv-cache-memory-bytes 4294967296 \
+  --batch-size 1 \
+  --input-len 128 \
+  --output-len 1 \
+  --num-iters-warmup 1 \
+  --num-iters 1
+```
+
+该命令仍会构造/执行 CausalLM 外壳，因此其 latency 不是 block latency，只用于
+回答 12 层能否初始化和运行。正式 profiling 必须使用阶段 2 的专用 wrapper。
+
+这一阶段回答以下问题：
+
+- 真实维度的 Kimi-K3 层能否在 8 张 H20 上逐步扩展到完整 block；
 - MXFP4、KDA、MLA 和 MoE 分别选择了什么 backend；
-- 单层参数、KV/KDA state 和通信 buffer 占用多少显存；
+- 各层数下参数、KV/KDA state 和通信 buffer 占用多少显存；
 - TP8 和 EP8 是否可以正常初始化。
+- 首个完整 AttnRes block 是否能在每卡 96 GiB 内完成初始化和 forward；
+- 初始化峰值、稳态权重、workspace 和 cache 各占多少显存。
 
 `--load-format dummy` 只解决“不下载完整 checkpoint”，不能自动证明执行形态
 等价于真实 MXFP4 checkpoint。smoke test 还必须逐 rank 验证：
@@ -137,9 +264,29 @@ nsys --version
 - 每个 rank 的权重显存；
 - 首次稳定迭代中实际出现的关键 kernel 名称。
 
-这一阶段的时间不能用于完整模型外推，因为它只代表物理第 0 层。
+这一阶段的时间不能用于完整模型外推，因为尚未完成稳定计时和校准。
 
-验收标准：dummy 单层可以完成至少一次 prefill 和一次 decode，所有 rank 正常退出。
+#### 阶段 1 验证
+
+验证位置：服务器。本地只先检查命令、配置和 override 解析，不在本地猜测 H20
+显存或 backend 结果。
+
+每个层数都执行以下验证：
+
+1. 在第二个终端用 `nvidia-smi dmon -s m -d 1` 覆盖整个进程生命周期；
+2. 完成一次现有 latency smoke，保存 stdout/stderr 和 dmon 输出；
+3. 检查所有 rank 正常退出；
+4. 检查实际层数、逻辑层号、KDA/MLA 类型、local expert ID 和 MXFP4 backend；
+5. 记录外部观测到的每卡最大显存。更细的模型构造、dummy quantization、KV cache
+   和首次 forward 分阶段 allocated/reserved 在阶段 2 wrapper 中实现。
+
+通过标准：
+
+- 1 层必须通过，否则停止并修复环境/backend，但不据此启动单层 profiling 开发；
+- 在固定 4 GiB KV cache 时，12 层若每卡峰值不超过 80 GiB，进入主 benchmark；
+- 峰值在 80 至 88 GiB 时标记为高风险，先评估 profiler 和目标 context 余量；
+- 超过 88 GiB、OOM 或初始化不稳定时停止在阶段 1，记录最大成功层数并重新评审；
+- 不允许通过 CPU offload 获得“通过”。
 
 ### 阶段 2：实现 profiling benchmark 框架
 
@@ -147,8 +294,10 @@ nsys --version
 
 ```text
 benchmarks/kimi_k3_layer_profiling/
+├── __init__.py
 ├── README.md
 ├── benchmark.py
+├── block_model.py
 ├── config.py
 ├── workload.py
 ├── layer_factory.py
@@ -156,6 +305,8 @@ benchmarks/kimi_k3_layer_profiling/
 ├── timing.py
 ├── profiling.py
 ├── result.py
+├── model_config/
+│   └── config.json
 └── shapes/
     ├── smoke.yaml
     ├── prefill.yaml
@@ -166,22 +317,30 @@ benchmarks/kimi_k3_layer_profiling/
 各文件职责：
 
 - `benchmark.py`：命令行入口、分布式启动和实验循环；
+- `block_model.py`：benchmark 专用模型 wrapper，只运行层 0 至 11 并返回 block
+  边界状态，不构造 embedding/LM head，不执行模型末端 `output_attn_res`；复用或
+  委托 Kimi 的 hybrid-cache state shape/copy 接口；若调用 `compute_logits` 则
+  fail fast，防止 benchmark 意外进入 sampling 路径；
 - `config.py`：读取 YAML、校验 shape 和并行策略；
 - `workload.py`：把实验 shape 转换为 vLLM 可消费的请求和调度输入；
-- `layer_factory.py`：构造只含目标层的 `KimiLinearModel`，并注入 benchmark
-  专用逻辑层描述；
+- `layer_factory.py`：复用真实 `KimiDecoderLayer` 构造逻辑层 0 至 11 的
+  `ModuleList` 和 block state；不能直接实例化会附带 embedding/output 聚合的
+  `KimiLinearModel`；
 - `runner.py`：复用真实 vLLM model runner 完成输入准备、forward context、
   cache metadata 和模型 forward，不自行实现简化执行栈；
 - `timing.py`：warmup、CUDA event、同步和各 rank latency 汇总；
 - `profiling.py`：控制 PyTorch Profiler、Nsys capture range 和 Proton；
 - `result.py`：汇总各 rank 数据并写出 JSON/Markdown；
 - `shapes/*.yaml`：可复现实验配置。
+- `model_config/config.json`：从 GitHub 分发的 Kimi-K3 config-only 快照；
+- `tools/profiler/nsys_profile_tools/vllm_engine_model.json`：在现有 `vllm` 映射内
+  新增 `kimi-k3` 的 KDA、MLA、MXFP4 MoE、AttnRes 和 NCCL kernel 分类。
 
 命令行接口至少应包含：
 
 ```text
 --model
---logical-layer-index
+--num-layers
 --phase
 --batch-size
 --query-len
@@ -207,79 +366,137 @@ benchmarks/kimi_k3_layer_profiling/
 - `--config FILE`：从 YAML 批量执行；
 - `--profile none|torch|cuda|proton`：选择 profiler。
 
-### 阶段 3：支持任意逻辑层
+这里的 `--profile` 是本 benchmark 新增的适配层，不是可以直接假设存在的 vLLM
+参数。实现必须映射到真实 `ProfilerConfig` 和 start/stop：
 
-优先保持生产模型的默认行为不变，只增加默认关闭的 profiling 能力。预计需要对
-以下文件做窄范围修改：
+- `torch`：配置绝对 `torch_profiler_dir`，输出逐 rank `.pt.trace.json.gz`；
+- `cuda`：调用 `torch.cuda.profiler.start/stop`，供外部 Nsys capture range 使用；
+- `proton`：配置 Proton 输出目录和格式；
+- `none`：不创建 profiler，专门用于正式 latency。
+
+第一版固定逻辑起始层为 0，正式实验要求 `--num-layers 12`。该参数保留仅用于
+1/4/8/12 层显存阶梯和失败排查，不提供单层类型选择或逻辑 offset。若 12 层最终
+无法安全运行，必须先重新评审目标，不能静默把较少层数称为完整 block。
+
+#### 阶段 2 验证
+
+验证顺序：先完成配置、schema 和结果聚合的本地验证；全部通过并提交后，服务器
+只执行真实 8 rank 输出、execution stack 和最小 P1/D1 smoke。
+
+1. `--dry-run` 对非法 TP/DP/EP/DCP、负长度和当前阶段不允许的起始层/层数必须
+   fail closed；正式模式只接受逻辑起始层 0、层数 12；
+2. 同一 YAML 连续运行两次，除时间和温度等动态字段外，manifest 必须一致；
+3. 本地使用 8 份合成 rank record 验证 summary JSON/Markdown 和 manifest 聚合；
+4. 本地验证 group/local-expert 计算，服务器再与真实 8 rank 输出交叉检查；
+5. 服务器 P1 和 D1 均生成 8 个真实 rank JSON 和完整 summary/manifest；
+6. 用 trace 或 instrumentation 证明主路径经过 model runner 输入准备、真实
+   forward context 和模型 forward，而不是直接调用 decoder layer。
+7. 检查模型参数名中不存在 `embed_tokens`、`lm_head`、`vision_tower`，并检查
+   `model.layers.12` 不存在；
+8. 检查 block forward 没有调用 `output_attn_res_norm/output_attn_res_proj`。
+9. 在 worker 内部分别记录模型构造后、dummy quantization 后、KV cache 分配后、
+   首次 forward 后和 CUDA Graph capture 后的 allocated/reserved。
+10. 主 benchmark 调用 `compute_logits` 或 sampler 时测试必须失败，而不是产生一份
+    混入 LM head 的结果。
+
+通过标准：以上十项全部通过，并且失败实验也能写出失败阶段和异常类型。
+
+### 阶段 3：首个 Block Execution Stack 接入
+
+本阶段只接入逻辑层 0 至 11。wrapper 复用真实 `KimiDecoderLayer`、KDA/MLA、
+MoE 和 cache state 接口，但不能直接实例化会附带 embedding、模型末端 AttnRes
+和 norm 的 `KimiLinearModel`。只有在必要时才把可复用的 layer-loop/cache helper
+从生产模型中做行为不变的窄范围抽取。禁止为了未来任意逻辑 block 提前加入
+logical offset 或合成历史 AttnRes state。
+
+优先通过 `--model-class-overrides` 将 `KimiLinearForCausalLM` 指向
+`block_model.py` 中的 benchmark wrapper，避免把研究接口加入正式 serving CLI：
 
 ```text
-vllm/models/kimi_k3/nvidia/model.py
+--model-class-overrides \
+  '{"KimiLinearForCausalLM":"benchmarks.kimi_k3_layer_profiling.block_model:KimiK3BlockProfiler"}'
 ```
 
-拟议修改：
+如果 worker 子进程无法导入 `benchmarks` 命名空间，必须先修复包路径/模块注册，
+不能回退到标准 CausalLM 并把额外开销从结果中“估算扣除”。
 
-1. benchmark 专用 factory 向单层模型传入可选的 `logical_layer_idx`；
-2. 未指定时继续从 `prefix` 解析层号，保证正常模型行为不变；
-3. profiling 模式下只构造一个物理层，但使用指定逻辑层号判断层类型；
-4. 将“目标层身份”和“进入该层前的 AttnRes 状态”作为两个独立输入；
-5. cache layer name 保持物理单层命名，避免为不存在的层分配 cache；
-6. 不增加正式 serving CLI，生产路径在未传 profiling 配置时完全不变。
+首个 block 必须保留：
 
-benchmark 内部配置示例：
+1. `model.layers.0...11` 的真实模块和 prefix；
+2. vLLM model runner 的输入准备与 forward context；
+3. 每层真实 KDA/MLA 和 MoE 选择；
+4. block 内 AttnRes prefix、bank、第 0 层 block-write 和 block 输出状态；
+5. 真实 KV/KDA cache metadata 和 TP8/EP8 collective；
+6. synthetic hidden states 输入，但不构造 embedding 和 LM head。
 
-```python
-KimiLayerProfilingConfig(
-    logical_layer_idx=30,
-    incoming_attn_res_blocks=synthetic_blocks,
-    incoming_attn_res_prefix_sum=synthetic_prefix_sum,
-)
-```
+#### 阶段 3 验证
 
-该对象属于 benchmark/factory，不写入 Hugging Face model config。逻辑层号负责
-选择 KDA/MLA、MoE/dense、block-write 等结构；合成的入站状态负责复现深层
-AttnRes 的读取成本。二者不能混为“按层号自动构造一些零张量”。物理 prefix 仍为
-`model.layers.0`，以保持 cache 和静态 forward context 的注册一致。
+验证顺序：模块树、层分类和 tiny block parity 先在本地完成；真实尺寸 forward 和
+backend 检查放到服务器。
 
-验收标准：能够分别构造 KDA 和 MLA 代表层，且层分类与完整 K3 config 一致。
+1. 确认只创建 `model.layers.0...11`，不存在第 12 层、embedding、LM head 或
+   vision tower 参数；
+2. 比较 0 至 11 层分类与原始 K3 config，必须逐层一致；
+3. 用 tiny config 比较 isolated 12-layer block 返回的
+   `(pending_hidden_states, prefix_sum, block_residual_bank)` 与小型完整模型在
+   第 11 层后的内部状态；
+4. 证明主路径经过 model runner 输入准备、forward context、cache 注册和 model
+   forward；
+5. H20 上完成 P1/D1 forward，并确认实际 backend、collective 和 AttnRes kernel。
+
+通过标准：模块范围准确；tiny block 三类边界状态均满足测试容差；P1/D1 状态的
+shape、dtype 和有限值正确；8 rank 无 hang、cache 冲突或 rank divergence。
 
 ### 阶段 4：正确性与分布式验证
 
 测试设计问题：
 
-1. 模块用途：在不加载完整模型的情况下复现一个真实 K3 decoder layer；
+1. 模块用途：在不加载完整模型的情况下复现首个真实 K3 连续 block；
 2. I/O 合约：输入为 packed hidden states、position 和真实 cache metadata，输出为
-   hidden states 及相应 cache/state 更新；
+   pending hidden states、prefix sum 和 block residual bank；
 3. 防止的故障：逻辑层分类错误、AttnRes 深度错误、cache 名冲突、collective
    shape 不一致；
-4. 最低成本测试：tiny config 单层 parity，其次 2 GPU distributed smoke。
+4. 最低成本测试：tiny config block parity，其次 2 GPU distributed smoke。
 
 计划新增：
 
 ```text
-tests/models/kimi_k3/test_layer_profiling.py
+tests/models/kimi_k3/test_block_profiling.py
 ```
 
 测试至少覆盖：
 
 - [ ] 默认配置下现有 K3 构造行为不变；
-- [ ] 指定 KDA 逻辑层时构造正确 attention；
-- [ ] 指定 MLA 逻辑层时构造正确 attention；
-- [ ] MoE/dense 分类与完整 config 一致；
-- [ ] AttnRes block 数与逻辑层位置一致；
-- [ ] 合成 AttnRes 入站状态的 shape、dtype、device 和真实小模型一致；
-- [ ] 单层模式没有创建其他 decoder layer 参数；
-- [ ] tiny config 下，isolated layer 与小型完整模型对应层输出一致；
+- [ ] 0 至 11 层的 KDA/MLA 和 MoE 分类与完整 config 一致；
+- [ ] block 内 AttnRes bank 和 block-write 位置正确；
+- [ ] block 模式没有创建第 12 层、embedding、LM head 或视觉参数；
+- [ ] block forward 没有执行模型末端 `output_attn_res`；
+- [ ] 意外进入 logits/sampling 路径时 fail fast；
+- [ ] tiny config 下，isolated block 与小型完整模型对应连续层输出一致；
 - [ ] 主 benchmark 确实经过 model runner 输入准备和 forward context；
 - [ ] TP/EP 下所有 rank tensor shape 一致。
 
 测试命令必须通过 `.venv/bin/python` 运行：
 
 ```bash
-.venv/bin/python -m pytest tests/models/kimi_k3/test_layer_profiling.py -v
+.venv/bin/python -m pytest tests/models/kimi_k3/test_block_profiling.py -v
 .venv/bin/python -m pytest tests/models/kimi_k3/test_kda.py -v
 .venv/bin/python -m pytest tests/models/kimi_k3/test_attn_res.py -v
 .venv/bin/python -m pytest tests/models/kimi_k3/test_sequence_parallel.py -v
 ```
+
+#### 阶段 4 验证
+
+验证顺序：
+
+1. 本地先运行新增 CPU/tiny 单元测试；
+2. 本地完成 import、配置测试和 `pre-commit`，保存命令和结果；
+3. 本地有兼容 CUDA GPU 时运行 1 GPU KDA/MLA/AttnRes 测试；否则放到服务器；
+4. 服务器运行 2 GPU tiny distributed smoke，检查 collective shape 和退出状态；
+5. 最后在 H20 上运行 8 GPU、P1/D1 首个 block smoke。
+
+通过标准：相关测试与 lint 全部通过；tiny block parity 达到测试中声明的
+容差；8 GPU 不发生 hang、rank divergence、NaN/Inf 或 cache 冲突。
 
 ### 阶段 5：性能测量和 profiler
 
@@ -299,6 +516,18 @@ tests/models/kimi_k3/test_layer_profiling.py
 用途：查看 operator、shape、Python/CUDA 映射和 vLLM iteration 标记。Trace 使用
 Perfetto 查看。正式计时时关闭 stack、shape 和 memory recording。
 
+采集命令由 benchmark 适配层实现，示例：
+
+```bash
+.venv/bin/python -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/prefill.yaml \
+  --profile torch \
+  --output-dir profile_outputs/torch_p1
+```
+
+验收时必须看到至少 8 个带 worker/rank 标识的 `.pt.trace.json.gz`，并能由
+Perfetto 打开。
+
 #### Nsight Systems
 
 主要用于：
@@ -316,8 +545,45 @@ Perfetto 查看。正式计时时关闭 stack、shape 和 memory recording。
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
+正式 Nsys 命令：
+
+```bash
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+mkdir -p profile_outputs
+
+nsys profile \
+  --trace=cuda,nvtx,osrt \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=repeat \
+  --force-overwrite=true \
+  --output profile_outputs/nsys_p1 \
+  .venv/bin/python -m benchmarks.kimi_k3_layer_profiling.benchmark \
+    --config benchmarks/kimi_k3_layer_profiling/shapes/prefill.yaml \
+    --profile cuda \
+    --output-dir profile_outputs/nsys_p1_results
+```
+
+`--profile cuda` 必须在 warmup 和 cache priming 完成后调用 CUDA profiler start，
+采集少量稳定 iteration 后 stop。最终验收文件为
+`profile_outputs/nsys_p1.nsys-rep`；若没有该文件则 profiling 未完成。
+
 可使用仓库内的 `tools/profiler/nsys_profile_tools/gputrc2graph.py` 将 Nsys GPU
 trace 转换为便于分析的图结构；原始 `.nsys-rep` 和导出的数据库仍不提交 Git。
+使用前必须修改 `tools/profiler/nsys_profile_tools/vllm_engine_model.json`，在现有
+`vllm` 节点内增加 `kimi-k3`。不要另建一个同样以 `vllm` 为顶层键的 JSON；当前
+loader 使用浅层 `dict.update`，会覆盖已有 `vllm` 模型映射。未添加 Kimi-K3
+映射时大量 kernel 会落入 `misc`。
+
+分析命令必须使用项目 Python 环境：
+
+```bash
+.venv/bin/python tools/profiler/nsys_profile_tools/gputrc2graph.py \
+  --in_file profile_outputs/nsys_p1.nsys-rep,vllm,kimi-k3,0 \
+  --out_dir profile_outputs/nsys_p1_analysis \
+  --title "Kimi-K3 block 0-11 P1"
+```
 
 #### Triton Proton
 
@@ -338,50 +604,56 @@ Graph 模式的最终性能结论。
 
 组件耗时来自 profiler，端到端延迟来自独立计时；二者允许因并发重叠而不相加。
 
-### 阶段 6：完整模型估算和校准
+#### 阶段 5 验证
 
-按代表层分桶：
+验证位置：最终计时和 profiler 在服务器；配置展开、结果聚合、统计计算和报告生成
+先用本地合成数据验证。
 
-```text
-T_model_step ≈
-    Σ N_kda_bucket  × T_kda_bucket
-  + Σ N_mla_bucket  × T_mla_bucket
-  + Σ N_dense_bucket × T_dense_bucket
-  + T_embedding
-  + T_lm_head
-  + T_scheduler
-  + T_sampling
-```
+1. 对 P1、P2、D1、D2 各重复执行至少 3 个独立进程 run；
+2. 每个 run warmup 后采集 30 至 100 次，使用最慢 rank 作为 distributed latency；
+3. 若同配置跨 run 的 P50 极差超过 5%，继续增加 warmup 并排查时钟、温度、JIT、
+   autotune 和后台进程，不发布该数据；
+4. 比较 profiler 开关前后的独立计时，确认正式数字来自 profiler 关闭状态；
+5. Nsys trace 中确认 attention/MoE 计算、NCCL、idle gap 和 rank skew 可定位；
+6. 对至少一个 shape 比较 block 总时间与逐层 profiler 归因，明确并发重叠导致的
+   不可加性。
+7. Decode trace 的 capture range 中不包含 cache priming，且 cache/state 在计时前
+   已由真实 prefill 写入；
+8. 对实际启用的 profiler 检查预期扩展名、逐 rank 命名和文件可读性；Nsys 和
+   PyTorch trace 为当前阶段必需，Proton 为可选补充。
 
-必须避免以下偏差：
+通过标准：核心 shape 跨 run P50 极差不超过 5%，没有失败 iteration，所有数字都
+能追溯到 manifest、逐 rank 数据和对应 trace。
 
-- 单层重复运行导致权重长期驻留 L2；
-- dummy router 总是选择少量 expert；
-- 把所有 kernel duration 简单相加，忽略并发和重叠；
-- 忽略 AttnRes 成本随逻辑层深度变化；
-- 用 eager 结果预测 CUDA Graph；
-- 用纯 prefill 与纯 decode 线性预测 mixed batch；
-- 用单层实验预测 pipeline parallel bubble。
+### 阶段 6：首个 Block 报告与后续决策
 
-每个 shape 至少区分：
+本阶段不做 93 层外推，只汇总逻辑层 0 至 11 的实测结论。报告至少包含：
 
-- `hot-layer`：同一层连续执行，权重和 metadata 具有较强复用；
-- `cache-perturbed-layer`：使用 L2 eviction buffer 或轮换多组权重，作为缓存
-  敏感性实验，不宣称它等价于完整模型流式执行；
-- `multi-layer-calibrated`：以真实多层运行测得的校准系数修正单层外推；
-- `uniform routing`；
-- 至少一种 skewed routing。
+- 适用的 Git commit、H20 环境和固定并行策略；
+- 每个 canonical shape 的 P10/P50/P90、最慢 rank 和峰值显存；
+- eager/CUDA Graph、routing 和 cache 条件；
+- KDA/MLA、MoE、NCCL、AttnRes、CPU launch 和 GPU idle 的 profiler 归因；
+- block 连续重复造成的缓存偏差；
+- dummy MXFP4 权重与真实 checkpoint 的差异；
+- 明确声明结果只适用于首个 block，不代表中间 block、末端 block 或完整服务。
 
-校准分成两个目的不同的实验：
+#### 阶段 6 验证
 
-1. 使用显存允许的最多连续层（目标 4 至 8 层）、真实 hidden size 的 dummy K3，
-   校准权重/cache locality、kernel 调度和通信重叠；若不足 4 层，必须记录实际
-   层数并扩大外推误差范围；
-2. 使用至少跨越一个 AttnRes block 边界的小模型，必要时缩小 hidden size，校准
-   block bank 的创建、读取和 block-write 结构。
+验证位置：报告代码先在本地用合成 fixture 验证并随 benchmark 推送；真实报告在
+服务器直接读取 H20 输出并生成，不要求服务器向 GitHub 或其他外部位置上传数据。
+如安全策略允许人工下载小型脱敏 summary，可在本地复核；原始 trace 默认留在
+服务器。
 
-先由单层数据预测校准模型，再与其真实端到端结果比较；达到预先设定的误差目标
-后，才外推完整模型。
+1. 从 manifest 自动生成所有表格，随机抽查至少 3 个 shape 与逐 rank 原始数据一致；
+2. 确认 distributed latency 始终取最慢 rank，而不是 rank 平均值；
+3. 确认正式 latency 来自 profiler 关闭的独立计时；
+4. 确认每个性能结论都能追溯到 commit、shape、backend、routing 和 trace；
+5. 确认报告中没有 93 层点估计、token 输出或完整服务延迟表述；
+6. 根据 trace 和实验缺口，单独形成后续决策记录：是否需要单层归因、任意逻辑
+   block、中间/末端 block 或更多并行策略。
+
+通过标准：数据抽查一致、限制说明完整、首个 block 的 profiling 流程可由同一
+commit 和配置复现。只有完成本阶段后，才评审是否启动单层 profiling。
 
 ## 6. 输入形状定义
 
@@ -414,6 +686,20 @@ M ≈ B × Q
 ```
 
 MLA cache 访问随 context length 变化，因此 decode 实验必须记录和扫描 `K`。
+
+Decode 不能只伪造 `K` 或 block table。每个 decode shape 必须先在 timed/profiled
+range 外完成 cache priming：
+
+```text
+cache_setup: prefill
+cache_setup_tokens_per_request: K - Q
+timed_query_tokens_per_request: Q
+```
+
+priming 必须真实经过同一个 block 的 KV/KDA state 写入路径。完成 priming 后同步，
+清零正式计时统计，但不清空 cache，再采集 decode iteration。D4/D5 若 priming 时间
+过长，可以把预热结果作为独立 setup 阶段复用，但 manifest 必须记录创建方式；
+不得用未初始化 cache 冒充 32K/128K context。
 
 第一版固定使用以下 canonical shapes，先建立可复现基线，再扩展不等长、mixed 和
 speculative workload：
@@ -457,7 +743,7 @@ M = 255, 256, 257
 第一轮只运行 `TP=8, DP=1, EP=8, DCP=1, PP=1`，先稳定 execution stack、
 shape 和采集流程；通过验收后再展开矩阵。
 
-第一轮固定 `PP=1`。单层实验不能测量真实 pipeline bubble。
+第一轮固定 `PP=1`。首个 block 实验不能测量真实 pipeline bubble。
 
 DCP 子矩阵根据 TP 约束选择，例如：
 
@@ -474,12 +760,8 @@ EP 不是一个可以脱离 TP/DP 单独相乘的抽象数字。vLLM 的 expert-
 由实际并行布局共同决定，因此 manifest 必须保存每个 rank 的 TP、DP、EP、DCP
 group 成员，以及该 rank 的 local expert 数量和 expert ID；不能只记录四个 size。
 
-逻辑层采样至少覆盖：第一个有效层、AttnRes 周期 `R` 附近、`4R` 附近和最后
-一层，并保证 KDA/MLA、MoE/dense 与 block-write 分类均被覆盖。最终分桶键至少为：
-
-```text
-(attention_type, ffn_type, attn_res_depth, block_write)
-```
+当前阶段固定逻辑层 0 至 11，不扫描其他层。报告仍应逐层记录 attention、FFN 和
+block-write 类型，方便判断完成首个 block 后是否需要单层或其他逻辑 block。
 
 ## 8. MoE routing 策略
 
@@ -545,6 +827,7 @@ profile_outputs/
 
 ```yaml
 model: moonshotai/Kimi-K3
+model_config_source: benchmarks/kimi_k3_layer_profiling/model_config/config.json
 git_commit: null
 gpu_name: null
 gpu_count: 8
@@ -554,11 +837,22 @@ vllm_version: null
 nccl_version: null
 dtype: bfloat16
 weight_format: mxfp4
+weight_source: dummy
+measurement_fidelity: shape-faithful/backend-faithful
 selected_backends: {}
 weight_storage_by_rank: []
 kernel_names: []
 physical_layer_index: 0
-logical_layer_index: null
+profiling_unit: block
+physical_start_layer: 0
+logical_start_layer: 0
+num_profiled_layers: 12
+logical_layer_range: [0, 11]
+block_output_contract:
+  - pending_hidden_states
+  - prefix_sum
+  - block_residual_bank
+applies_model_output_attn_res: false
 layer_type: null
 attention_type: null
 ffn_type: null
@@ -579,11 +873,16 @@ all2all_backend: null
 execution_mode: eager
 routing_strategy: null
 cache_mode: null
+cache_priming:
+  method: null
+  tokens_per_request: null
 warmup_iters: null
 repeat_iters: null
 random_seed: 0
 latency_ms_by_rank: []
 distributed_latency_ms: null
+memory_by_phase: {}
+profile_artifacts: []
 ```
 
 ## 11. 每次实验的检查清单
@@ -598,6 +897,8 @@ distributed_latency_ms: null
 - [ ] 各 rank 的 TP/DP/EP/DCP group 和 local experts 符合预期；
 - [ ] backend 日志与 manifest 一致；
 - [ ] dummy 权重的最终 storage/dtype 与选定 backend 已验证；
+- [ ] profiling unit、物理/逻辑层范围和 AttnRes 入站深度已核对；
+- [ ] block 输出契约为三类内部状态，且末端 output AttnRes 未执行；
 - [ ] kernel JIT、autotune 和 graph capture 不计入正式时间。
 
 运行后：
@@ -607,8 +908,9 @@ distributed_latency_ms: null
 - [ ] 记录峰值显存；
 - [ ] 记录异常值和失败次数；
 - [ ] trace 只包含少量稳定 iteration；
-- [ ] summary 中明确 hot-layer/cache-perturbed/multi-layer-calibrated、routing
-  和 eager/graph；
+- [ ] decode cache priming 不在正式计时/trace range 内；
+- [ ] profiling 文件存在、非空、可由对应工具打开；
+- [ ] summary 中明确连续重复/cache-perturbed block、routing 和 eager/graph；
 - [ ] 结果目录包含完整 manifest。
 
 ## 12. 当前里程碑
@@ -621,15 +923,22 @@ distributed_latency_ms: null
 - [x] 确认 8 张 H20 位于完整 NVLink 域；
 - [x] 确认服务器 CUDA Toolkit 为 13.0；
 - [ ] 完成 Python 3.12、uv 和 editable vLLM 环境安装；
+- [ ] 提交并验证 config-only Kimi-K3 模型目录；
 - [ ] 保存环境基线；
-- [ ] 完成不修改模型代码的单层 smoke test；
+- [ ] 完成不修改模型代码的 1/4/8/12 层显存阶梯测试；
+- [ ] 确定 12 层 block 是否低于每卡 80 GiB 安全线；
 - [ ] 确认 H20 上 K3/MXFP4 实际 backend；
 - [ ] 实现 benchmark 配置与结果框架；
-- [ ] 实现 logical layer profiling；
+- [ ] 实现 benchmark 专用 `KimiK3BlockProfiler` 模型 wrapper；
+- [ ] 验证 block 边界三元状态且不执行模型末端 AttnRes；
+- [ ] 实现首个 12 层 AttnRes block profiling；
 - [ ] 完成正确性测试；
 - [ ] 完成 TP8/EP8 首轮数据；
-- [ ] 完成显存允许的最大连续多层校准（目标 4 至 8 层）；
-- [ ] 形成完整 profiling 报告。
+- [ ] 完成首个 block 的 canonical shape 和 profiler 数据；
+- [ ] 增加并验证 Kimi-K3 Nsys kernel 分类；
+- [ ] 生成并打开至少一份 `.nsys-rep` 和一组逐 rank PyTorch trace；
+- [ ] 形成首个 block profiling 报告；
+- [ ] 评审是否需要单层或其他逻辑 block（当前不实施）。
 
 ## 13. 工作原则
 
@@ -638,4 +947,6 @@ distributed_latency_ms: null
 3. benchmark 数字和 profiler trace 分开采集；
 4. 每个结论都能追溯到 commit、配置、硬件和原始结果；
 5. 任何 backend fallback 都必须显式记录；
-6. 在外推完整模型前，必须先通过多层小模型校准。
+6. 首个 block 报告完成前，不启动单层、其他逻辑 block 或 93 层外推；
+7. 当前报告只覆盖 decoder，不得暗示包含 embedding、LM head 或完整服务开销；
+8. 每个阶段必须保存验证命令、结果、通过标准和失败原因后才能进入下一阶段。
