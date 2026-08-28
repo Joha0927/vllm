@@ -232,6 +232,7 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+!benchmarks/kimi_k3_layer_profiling/model_config/config.json
 
 # Linting
 actionlint
