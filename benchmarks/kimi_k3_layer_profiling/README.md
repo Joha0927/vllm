@@ -337,6 +337,43 @@ KV cache: 4.0 GiB per worker
 
 ### 阶段 2：实现 profiling benchmark 框架
 
+#### 当前实现与 8-rank distributed-group 实测记录
+
+截至 2026-08-29，已实现配置和 dry-run 骨架：
+
+- `config.py` 从固定的 `model_config/config.json` 读取模型结构；YAML 只能配置
+  workload、层数和运行策略，不能覆盖 hidden size、专家数、注意力头数或起始层；
+- `benchmark.py` 已提供 `--dry-run`、`--list-layer-types`、manifest 预览和
+  `--distributed-smoke`；
+- `distributed.py` 将 benchmark 配置转换为 vLLM `ParallelConfig`，先在 NCCL
+  world group 上检查 8 个 rank 的配置摘要一致，再初始化 TP/DCP/DP/EP group；
+- 本地配置测试共 25 项通过，且 dry-run 不导入 Torch 或 vLLM。
+
+服务器上的 8×H20 distributed-group smoke 已通过：
+
+```text
+world_size = 8
+TP = 8
+EP = 8
+DCP = 1
+rank/local_rank/tp_rank/ep_rank = 0..7 exactly once
+dcp_rank = 0 on every rank
+device = NVIDIA H20 on every rank
+requested_all2all_backend = allgather_reducescatter
+smoke_scope = distributed_groups
+PASS records = 8
+torchrun_exit_code = 0
+```
+
+日志中未出现 traceback、NCCL error、timeout 或 worker 异常退出。该结果只证明
+基础 NCCL world 和 vLLM distributed groups 能够建立，不能证明 worker、model
+runner、模型加载、MoE dispatch/combine 或 block forward 已执行。backend 字段是
+请求值；实际 MoE backend 必须在 block forward 中另行确认。
+
+本次 `run_meta.txt` 的 `git_commit` 为空。这不影响 distributed smoke 判定，但属于
+追溯信息缺口；正式 block 实验必须在启动前记录 `git rev-parse HEAD`，不得沿用该
+空值。
+
 计划在本目录新增：
 
 ```text
@@ -975,7 +1012,9 @@ profile_artifacts: []
 - [ ] 完成不修改模型代码的 1/4/8/12 层显存阶梯测试；
 - [x] 确定 12 层 block 是否低于每卡 80 GiB 安全线；
 - [x] 确认 H20 上 K3/MXFP4 实际 backend；
-- [ ] 实现 benchmark 配置与结果框架；
+- [x] 实现 benchmark 配置、dry-run 和 deterministic manifest 预览；
+- [x] 完成 8×H20 的 TP8/EP8/DCP1 distributed-group smoke；
+- [x] 使用 8 份合成 rank record 验证结果聚合和 summary 输出；
 - [ ] 实现 benchmark 专用 `KimiK3BlockProfiler` 模型 wrapper；
 - [ ] 验证 block 边界三元状态且不执行模型末端 AttnRes；
 - [ ] 实现首个 12 层 AttnRes block profiling；
