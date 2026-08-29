@@ -288,6 +288,53 @@ vllm bench latency \
 - 超过 88 GiB、OOM 或初始化不稳定时停止在阶段 1，记录最大成功层数并重新评审；
 - 不允许通过 CPU offload 获得“通过”。
 
+#### 阶段 1 实际验收记录（2026-08-28）
+
+验收 commit：`5e37eba8b47d545e681d7d284ba63eb57ef3a8f5`。
+
+12 层 direct smoke 在单机 8×H20 上完成初始化、一次 warmup 和一次正式
+generation，`benchmark_exit_code=0`，8 个 worker 正常退出，无 OOM、NCCL error、
+timeout 或 worker crash。固定 4 GiB KV cache 时，各卡进程生命周期峰值均为
+34829 MiB（约 34.0 GiB），低于 80 GiB 安全线。运行配置确认如下：
+
+```text
+num_hidden_layers=12
+load_format=dummy
+TP=8, DP=1, EP enabled, DCP=1, PP=1
+execution_mode=eager
+quantization=mxfp4
+```
+
+普通运行日志已明确证明以下 runtime backend，而不是仅从 config 推断：
+
+```text
+KDA decode: fused KDA decode kernel enabled
+KDA prefill: FlashKDA
+MLA attention: FLASH_ATTN_MLA
+MLA prefill: FLASH_ATTN
+MXFP4 MoE backend: MARLIN
+MoE expert implementation: MarlinExperts
+EP rank 0 local/global experts: 112/896
+EP rank 0 local-to-global expert map: 0..111
+NCCL world size: 8
+KV cache: 4.0 GiB per worker
+```
+
+验收结论：`PASS WITH MINOR EVIDENCE GAPS`。阶段 1 的核心问题——12 层能否运行、
+是否低于显存安全线，以及 H20 上实际 KDA、MLA 和 MXFP4 MoE backend——已经回答，
+允许进入阶段 2。以下缺口不能从现有 `vllm bench latency` INFO 日志充分证明，转为
+阶段 2 首批 instrumentation 验收项，不视为已完成或静默跳过：
+
+- 8 个 rank 各自的 local expert 数量和完整 expert ID；
+- 每个 rank 的最终 dummy MXFP4 参数 storage、shape 和 dtype；
+- MoE dispatch/combine 实际使用 `allgather_reducescatter` 的运行时确认；
+- 逻辑层 0 至 11 的逐层 KDA/MLA、dense/MoE 和 block-write 分类；
+- H20 上 AttnRes、latent-MoE tail 和专用 GEMM 路径的完整 fallback 原因。
+
+低层 CUDA kernel 名称不再要求由普通 INFO 日志完整提供，留到阶段 5 使用 Nsys
+采集和分类。阶段 2 的最小 instrumentation 必须先补齐上述结构与 backend 证据，
+再继续实现正式计时路径。
+
 ### 阶段 2：实现 profiling benchmark 框架
 
 计划在本目录新增：
@@ -922,12 +969,12 @@ profile_artifacts: []
 - [x] H20 服务器成功拉取工作分支；
 - [x] 确认 8 张 H20 位于完整 NVLink 域；
 - [x] 确认服务器 CUDA Toolkit 为 13.0；
-- [ ] 完成 Python 3.12、uv 和 editable vLLM 环境安装；
-- [ ] 提交并验证 config-only Kimi-K3 模型目录；
-- [ ] 保存环境基线；
+- [x] 完成 Python 3.12、uv 和 editable vLLM 环境安装；
+- [x] 提交并验证 config-only Kimi-K3 模型目录；
+- [x] 保存环境基线；
 - [ ] 完成不修改模型代码的 1/4/8/12 层显存阶梯测试；
-- [ ] 确定 12 层 block 是否低于每卡 80 GiB 安全线；
-- [ ] 确认 H20 上 K3/MXFP4 实际 backend；
+- [x] 确定 12 层 block 是否低于每卡 80 GiB 安全线；
+- [x] 确认 H20 上 K3/MXFP4 实际 backend；
 - [ ] 实现 benchmark 配置与结果框架；
 - [ ] 实现 benchmark 专用 `KimiK3BlockProfiler` 模型 wrapper；
 - [ ] 验证 block 边界三元状态且不执行模型末端 AttnRes；
