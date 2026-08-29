@@ -9,7 +9,6 @@ from typing import Any
 
 from benchmarks.kimi_k3_layer_profiling.config import BenchmarkConfig
 
-
 _TORCHRUN_ENV = {"LOCAL_RANK", "RANK", "WORLD_SIZE"}
 
 
@@ -23,10 +22,8 @@ def parallel_config_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
     }
 
 
-def _config_digest(config: BenchmarkConfig) -> bytes:
-    payload = json.dumps(
-        asdict(config), separators=(",", ":"), sort_keys=True
-    ).encode()
+def benchmark_config_digest(config: BenchmarkConfig) -> bytes:
+    payload = json.dumps(asdict(config), separators=(",", ":"), sort_keys=True).encode()
     return hashlib.sha256(payload).digest()
 
 
@@ -51,6 +48,7 @@ def run_distributed_smoke(config: BenchmarkConfig) -> None:
         init_distributed_environment,
         initialize_model_parallel,
     )
+    from vllm.platforms import current_platform
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -60,10 +58,10 @@ def run_distributed_smoke(config: BenchmarkConfig) -> None:
             f"torchrun world size {world_size} does not match gpu_count "
             f"{config.gpu_count}"
         )
-    if local_rank >= torch.cuda.device_count():
+    if local_rank >= torch.accelerator.device_count():
         raise RuntimeError(
             f"LOCAL_RANK={local_rank} exceeds visible CUDA device count "
-            f"{torch.cuda.device_count()}"
+            f"{torch.accelerator.device_count()}"
         )
 
     torch.accelerator.set_device_index(local_rank)
@@ -76,7 +74,7 @@ def run_distributed_smoke(config: BenchmarkConfig) -> None:
         initialized = True
 
         digest = torch.tensor(
-            list(_config_digest(config)), dtype=torch.uint8, device="cuda"
+            list(benchmark_config_digest(config)), dtype=torch.uint8, device="cuda"
         )
         gathered = [torch.empty_like(digest) for _ in range(world_size)]
         dist.all_gather(gathered, digest)
@@ -94,7 +92,7 @@ def run_distributed_smoke(config: BenchmarkConfig) -> None:
         record = {
             "dcp_rank": get_dcp_group().rank_in_group,
             "dcp_size": get_dcp_group().world_size,
-            "device": torch.cuda.get_device_name(local_rank),
+            "device": current_platform.get_device_name(local_rank),
             "ep_rank": get_ep_group().rank_in_group,
             "ep_size": get_ep_group().world_size,
             "local_rank": local_rank,

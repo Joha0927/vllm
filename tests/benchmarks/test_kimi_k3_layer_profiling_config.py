@@ -12,7 +12,11 @@ from benchmarks.kimi_k3_layer_profiling.config import (
     load_yaml,
 )
 from benchmarks.kimi_k3_layer_profiling.distributed import parallel_config_kwargs
-
+from benchmarks.kimi_k3_layer_profiling.model_construction import (
+    MODEL_CLASS_OVERRIDES,
+    engine_args_kwargs,
+    validate_model_construction_config,
+)
 
 ROOT = Path(__file__).parents[2]
 SMOKE_CONFIG = ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml"
@@ -25,9 +29,7 @@ def _smoke_data() -> dict:
 def test_smoke_dry_run_describes_first_block() -> None:
     result = dry_run(_smoke_data())
 
-    assert result.config.model == (
-        "benchmarks/kimi_k3_layer_profiling/model_config"
-    )
+    assert result.config.model == ("benchmarks/kimi_k3_layer_profiling/model_config")
     assert result.config.hidden_size == 7168
     assert result.config.dtype == "bfloat16"
     assert result.config.weight_format == "mxfp4-pack-quantized"
@@ -128,9 +130,7 @@ def test_parallel_config_matches_benchmark_config() -> None:
 
 
 def test_distributed_smoke_cli_is_explicit() -> None:
-    args = parse_args(
-        ["--config", str(SMOKE_CONFIG), "--distributed-smoke"]
-    )
+    args = parse_args(["--config", str(SMOKE_CONFIG), "--distributed-smoke"])
 
     assert args.distributed_smoke
 
@@ -150,6 +150,45 @@ def test_distributed_smoke_rejects_manifest_output(tmp_path: Path) -> None:
         )
 
     assert not manifest.exists()
+
+
+def test_model_construction_uses_production_engine_config() -> None:
+    config = dry_run(_smoke_data()).config
+
+    assert engine_args_kwargs(config) == {
+        "all2all_backend": "allgather_reducescatter",
+        "data_parallel_size": 1,
+        "decode_context_parallel_size": 1,
+        "disable_log_stats": True,
+        "dtype": "bfloat16",
+        "enable_expert_parallel": True,
+        "enforce_eager": True,
+        "language_model_only": True,
+        "load_format": "dummy",
+        "max_model_len": 128,
+        "max_num_batched_tokens": 128,
+        "max_num_seqs": 1,
+        "model": "benchmarks/kimi_k3_layer_profiling/model_config",
+        "model_class_overrides": MODEL_CLASS_OVERRIDES,
+        "seed": 0,
+        "skip_tokenizer_init": True,
+        "tensor_parallel_size": 8,
+    }
+
+
+def test_model_construction_smoke_cli_is_explicit() -> None:
+    args = parse_args(["--config", str(SMOKE_CONFIG), "--model-construction-smoke"])
+
+    assert args.model_construction_smoke
+
+
+def test_model_construction_rejects_diagnostic_layer_count() -> None:
+    data = _smoke_data()
+    data["num_layers"] = 1
+    data["diagnostic_partial_block"] = True
+
+    with pytest.raises(ValueError, match="formal 12-layer block"):
+        validate_model_construction_config(dry_run(data).config)
 
 
 @pytest.mark.parametrize(

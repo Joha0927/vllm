@@ -3,16 +3,16 @@
 
 import argparse
 import json
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from benchmarks.kimi_k3_layer_profiling.config import (
     apply_overrides,
     dry_run,
     load_yaml,
 )
-
 
 _OVERRIDE_FIELDS = (
     "phase",
@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--distributed-smoke",
         action="store_true",
         help="Initialize and validate distributed groups without loading a model",
+    )
+    parser.add_argument(
+        "--model-construction-smoke",
+        action="store_true",
+        help="Construct the real 12-layer block without running forward",
     )
     parser.add_argument("--list-layer-types", action="store_true")
     parser.add_argument("--manifest-out", type=Path)
@@ -93,17 +98,19 @@ def run(argv: Sequence[str] | None = None) -> int:
     data: dict[str, Any] = load_yaml(args.config)
     result = dry_run(apply_overrides(data, _overrides_from_args(args)))
     selected_modes = sum(
-        (args.dry_run, args.distributed_smoke, args.list_layer_types)
+        (
+            args.dry_run,
+            args.distributed_smoke,
+            args.list_layer_types,
+            args.model_construction_smoke,
+        )
     )
     if selected_modes != 1:
-        raise SystemExit(
-            "Select exactly one of --dry-run, --distributed-smoke, or "
-            "--list-layer-types"
-        )
-    if args.distributed_smoke and args.manifest_out is not None:
-        raise SystemExit(
-            "--manifest-out is not supported with --distributed-smoke"
-        )
+        raise SystemExit("Select exactly one execution mode")
+    if (
+        args.distributed_smoke or args.model_construction_smoke
+    ) and args.manifest_out is not None:
+        raise SystemExit("--manifest-out is not supported with GPU smoke modes")
     if args.manifest_out is not None:
         args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
         args.manifest_out.write_text(
@@ -119,6 +126,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
 
         run_distributed_smoke(result.config)
+        return 0
+    if args.model_construction_smoke:
+        from benchmarks.kimi_k3_layer_profiling.model_construction import (
+            run_model_construction_smoke,
+        )
+
+        run_model_construction_smoke(result.config)
         return 0
     print(result.to_json())
     return 0
