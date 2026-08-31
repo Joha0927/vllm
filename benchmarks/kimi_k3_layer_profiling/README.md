@@ -375,6 +375,38 @@ runner、模型加载、MoE dispatch/combine 或 block forward 已执行。backe
 追溯信息缺口；正式 block 实验必须在启动前记录 `git rev-parse HEAD`，不得沿用该
 空值。
 
+#### Forward smoke hybrid-cache 初始化问题与修正
+
+首次 standalone 12 层 forward smoke 在 `get_kv_cache_groups()` 阶段失败。原始
+cache-spec 诊断显示，调用 grouping 前仍保留默认 `block_size=16`，且
+`mamba_page_size_padded=None`；对应的 KDA `MambaSpec` page 为 814080 bytes，MLA
+`MLAAttentionSpec` page 为 18432 bytes，通用 heterogeneous-cache grouping 无法统一
+二者的 page size。
+
+该失败不表示 vLLM 的 Kimi-K3 serving 路径不支持 hybrid cache。根因是 standalone
+profiler 直接构造 `GPUModelRunner`，绕过了 production executor 在模型加载后执行的
+平台初始化步骤：
+
+```text
+load_model()
+    -> current_platform.update_block_size_for_backend(vllm_config)
+    -> get_kv_cache_spec()
+    -> get_kv_cache_groups()
+    -> initialize_kv_cache()
+```
+
+`update_block_size_for_backend()` 会先从已构造的 attention layers 中找到非 SSM
+backend，选择 backend preferred block size，再为 hybrid model 对齐 attention block
+和 Mamba page，最后处理 heterogeneous KV dtype。它必须在模型构造/加载完成后调用；
+在模型构造前调用时，`_find_non_ssm_backend()` 无法从实际层中确定 backend。
+
+profiler 的修正原则是复用上述 public production API，不直接调用 private
+`_align_hybrid_block_size()`，也不手写对齐后的 block/page 数值。forward smoke 在
+调用前后记录 `block_size` 和 `mamba_page_size_padded`，并继续在 grouping 前输出所有
+KDA/MLA raw cache specs。后续任何绕过标准 Executor、直接构造 model runner 的测试，
+都必须保留同一时序；不得把 standalone harness 缺失的初始化步骤归因于模型 backend
+不受支持。
+
 计划在本目录新增：
 
 ```text
@@ -1029,8 +1061,10 @@ profile_artifacts: []
 - [x] 实现 benchmark 配置、dry-run 和 deterministic manifest 预览；
 - [x] 完成 8×H20 的 TP8/EP8/DCP1 distributed-group smoke；
 - [x] 使用 8 份合成 rank record 验证结果聚合和 summary 输出；
-- [ ] 实现 benchmark 专用 `KimiK3BlockProfiler` 模型 wrapper；
-- [ ] 验证 block 边界三元状态且不执行模型末端 AttnRes；
+- [x] 实现 benchmark 专用 `KimiK3BlockProfiler` 模型 wrapper；
+- [x] 验证 block 边界三元状态且不执行模型末端 AttnRes；
+- [x] 定位并修正 standalone forward smoke 缺失 production hybrid-cache block/page
+  alignment 的问题；
 - [ ] 实现首个 12 层 AttnRes block profiling；
 - [ ] 完成正确性测试；
 - [ ] 完成 TP8/EP8 首轮数据；

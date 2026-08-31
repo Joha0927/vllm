@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +16,7 @@ from benchmarks.kimi_k3_layer_profiling.config import (
 )
 from benchmarks.kimi_k3_layer_profiling.distributed import parallel_config_kwargs
 from benchmarks.kimi_k3_layer_profiling.forward_smoke import (
+    align_cache_block_size,
     ensure_tracked_worktree_clean,
     expected_all2all_manager_class,
     forward_engine_args_kwargs,
@@ -263,6 +266,37 @@ def test_forward_smoke_reports_raw_cache_specs_in_layer_order() -> None:
     assert [record["layer_index"] for record in evidence] == [0, 3]
     assert [record["cache_kind"] for record in evidence] == ["KDA", "MLA"]
     assert [record["page_size_bytes"] for record in evidence] == [4096, 8192]
+
+
+def test_forward_smoke_uses_production_cache_alignment_api(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cache_config = SimpleNamespace(
+        block_size=16,
+        mamba_page_size_padded=None,
+    )
+    vllm_config = SimpleNamespace(cache_config=cache_config)
+
+    class FakePlatform:
+        @classmethod
+        def update_block_size_for_backend(cls, config) -> None:
+            assert config is vllm_config
+            config.cache_config.block_size = 768
+            config.cache_config.mamba_page_size_padded = 884736
+
+    align_cache_block_size(vllm_config, 3, FakePlatform)
+    evidence = json.loads(capsys.readouterr().out)
+
+    assert evidence["rank"] == 3
+    assert evidence["stage"] == "cache_backend_alignment"
+    assert evidence["before"] == {
+        "block_size": 16,
+        "mamba_page_size_padded": None,
+    }
+    assert evidence["after"] == {
+        "block_size": 768,
+        "mamba_page_size_padded": 884736,
+    }
 
 
 @pytest.mark.parametrize(

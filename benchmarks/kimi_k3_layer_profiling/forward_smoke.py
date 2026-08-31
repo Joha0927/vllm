@@ -350,6 +350,33 @@ def _print_stage(rank: int, stage: str) -> None:
     )
 
 
+def align_cache_block_size(vllm_config, rank: int, current_platform) -> None:
+    cache_config = vllm_config.cache_config
+    before = {
+        "block_size": cache_config.block_size,
+        "mamba_page_size_padded": cache_config.mamba_page_size_padded,
+    }
+    current_platform.update_block_size_for_backend(vllm_config)
+    after = {
+        "block_size": cache_config.block_size,
+        "mamba_page_size_padded": cache_config.mamba_page_size_padded,
+    }
+    print(
+        json.dumps(
+            {
+                "after": after,
+                "before": before,
+                "rank": rank,
+                "smoke_scope": "real_block_forward",
+                "stage": "cache_backend_alignment",
+                "status": "DIAGNOSTIC",
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
 def run_forward_smoke(config: BenchmarkConfig) -> None:
     validate_forward_smoke_config(config)
     ensure_tracked_worktree_clean()
@@ -451,6 +478,10 @@ def run_forward_smoke(config: BenchmarkConfig) -> None:
             runner.load_model(load_dummy_weights=True)
         torch.accelerator.synchronize()
         memory_after_load = memory_mib(torch)
+
+        failure_stage = "cache_backend_alignment"
+        _print_stage(rank, failure_stage)
+        align_cache_block_size(vllm_config, rank, current_platform)
 
         failure_stage = "kv_cache_init"
         _print_stage(rank, failure_stage)
