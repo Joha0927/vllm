@@ -78,13 +78,85 @@ def validate_forward_smoke_config(config: BenchmarkConfig) -> None:
         raise ValueError("Fresh-prefill forward smoke requires cache_mode=none")
 
 
-def _initialize_kv_cache(runner, config: BenchmarkConfig):
+def _layer_index(layer_name: str) -> int | None:
+    parts = layer_name.split(".")
+    try:
+        return int(parts[parts.index("layers") + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _spec_value(spec, name: str):
+    try:
+        value = getattr(spec, name)
+    except AttributeError:
+        return None
+    except Exception as error:
+        return f"<{type(error).__name__}: {error}>"
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return str(value)
+
+
+def kv_cache_spec_evidence(kv_cache_spec: dict[str, Any]) -> list[dict[str, Any]]:
+    records = []
+    for layer_name, spec in kv_cache_spec.items():
+        spec_type = type(spec).__name__
+        cache_kind = {
+            "MambaSpec": "KDA",
+            "MLAAttentionSpec": "MLA",
+        }.get(spec_type, "unknown")
+        records.append(
+            {
+                "block_size": _spec_value(spec, "block_size"),
+                "cache_kind": cache_kind,
+                "dtypes": _spec_value(spec, "dtypes"),
+                "layer_index": _layer_index(layer_name),
+                "layer_name": layer_name,
+                "num_heads": _spec_value(spec, "num_heads"),
+                "num_states": _spec_value(spec, "num_states"),
+                "page_size_bytes": _spec_value(spec, "page_size_bytes"),
+                "page_size_padded": _spec_value(spec, "page_size_padded"),
+                "shapes": _spec_value(spec, "shapes"),
+                "spec_type": spec_type,
+                "state_content_size_bytes": _spec_value(
+                    spec, "state_content_size_bytes"
+                ),
+                "tokens_per_state": _spec_value(spec, "tokens_per_state"),
+            }
+        )
+    return sorted(
+        records,
+        key=lambda record: (
+            record["layer_index"] is None,
+            record["layer_index"] if record["layer_index"] is not None else 0,
+            record["layer_name"],
+        ),
+    )
+
+
+def _initialize_kv_cache(runner, config: BenchmarkConfig, rank: int):
     from vllm.v1.core.kv_cache_utils import (
         get_kv_cache_config_from_groups,
         get_kv_cache_groups,
     )
 
     kv_cache_spec = runner.get_kv_cache_spec()
+    print(
+        json.dumps(
+            {
+                "cache_specs": kv_cache_spec_evidence(kv_cache_spec),
+                "rank": rank,
+                "smoke_scope": "real_block_forward",
+                "stage": "raw_kv_cache_specs",
+                "status": "DIAGNOSTIC",
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     kv_cache_groups = get_kv_cache_groups(runner.vllm_config, kv_cache_spec)
     if not kv_cache_groups:
         raise RuntimeError("Kimi-K3 block did not register KV cache layers")
@@ -382,7 +454,7 @@ def run_forward_smoke(config: BenchmarkConfig) -> None:
 
         failure_stage = "kv_cache_init"
         _print_stage(rank, failure_stage)
-        kv_cache_config, widths = _initialize_kv_cache(runner, config)
+        kv_cache_config, widths = _initialize_kv_cache(runner, config, rank)
         failure_stage = "input_and_metadata"
         _print_stage(rank, failure_stage)
         input_batch, attn_metadata, slot_mappings, inputs_embeds = _prepare_prefill(

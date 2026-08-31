@@ -17,6 +17,7 @@ from benchmarks.kimi_k3_layer_profiling.forward_smoke import (
     ensure_tracked_worktree_clean,
     expected_all2all_manager_class,
     forward_engine_args_kwargs,
+    kv_cache_spec_evidence,
     validate_forward_smoke_config,
 )
 from benchmarks.kimi_k3_layer_profiling.model_construction import (
@@ -233,6 +234,35 @@ def test_forward_smoke_validates_ag_rs_backend(backend: str) -> None:
 def test_forward_smoke_rejects_unknown_backend_evidence() -> None:
     with pytest.raises(ValueError, match="cannot validate all2all backend"):
         expected_all2all_manager_class("unknown")
+
+
+def test_forward_smoke_reports_raw_cache_specs_in_layer_order() -> None:
+    mamba_spec = type("MambaSpec", (), {})()
+    mamba_spec.block_size = 128
+    mamba_spec.num_heads = 1
+    mamba_spec.num_states = 1
+    mamba_spec.page_size_bytes = 4096
+    mamba_spec.page_size_padded = None
+    mamba_spec.state_content_size_bytes = 4096
+    mamba_spec.tokens_per_state = -1
+    mla_spec = type("MLAAttentionSpec", (), {})()
+    mla_spec.block_size = 128
+    mla_spec.num_heads = 1
+    mla_spec.num_states = 128
+    mla_spec.page_size_bytes = 8192
+    mla_spec.state_content_size_bytes = 64
+    mla_spec.tokens_per_state = 1
+
+    evidence = kv_cache_spec_evidence(
+        {
+            "model.layers.3.self_attn": mla_spec,
+            "model.layers.0.self_attn": mamba_spec,
+        }
+    )
+
+    assert [record["layer_index"] for record in evidence] == [0, 3]
+    assert [record["cache_kind"] for record in evidence] == ["KDA", "MLA"]
+    assert [record["page_size_bytes"] for record in evidence] == [4096, 8192]
 
 
 @pytest.mark.parametrize(
