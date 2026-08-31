@@ -230,6 +230,7 @@ def test_production_profile_uses_engine_core_without_model_override() -> None:
     assert kwargs["enable_layerwise_nvtx_tracing"] is True
     assert kwargs["enforce_eager"] is True
     assert kwargs["enable_prefix_caching"] is False
+    assert kwargs["kv_cache_memory_bytes"] == 4 * 1024**3
     assert "model_class_overrides" not in kwargs
     assert "enable_prompt_embeds" not in kwargs
 

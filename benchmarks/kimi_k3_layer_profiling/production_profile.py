@@ -39,6 +39,7 @@ def production_engine_args_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
         "hf_overrides": {"text_config": {"num_hidden_layers": config.num_layers}},
         "language_model_only": True,
         "load_format": "dummy",
+        "kv_cache_memory_bytes": 4 * 1024**3,
         "max_model_len": config.context_len + 1,
         "max_num_batched_tokens": max(
             config.num_scheduled_tokens, config.context_len + 1
