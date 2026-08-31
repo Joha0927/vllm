@@ -245,8 +245,10 @@ vllm bench latency \
   --num-iters 1
 ```
 
-该命令仍会构造/执行 CausalLM 外壳，因此其 latency 不是 block latency，只用于
-回答 12 层能否初始化和运行。正式 profiling 必须使用阶段 2 的专用 wrapper。
+该命令仍会构造/执行 CausalLM 外壳，因此其端到端 latency 不是 block latency，只用于
+回答 12 层能否初始化和运行。正式 profiling 也复用同一 production Engine 路径，但
+通过 NVTX 中 `language_model.model.layers.0..11` 的真实模块范围提取 block 时间；不再
+用专用 wrapper 替换 production model。
 
 这一阶段回答以下问题：
 
@@ -279,7 +281,7 @@ vllm bench latency \
 3. 检查所有 rank 正常退出；
 4. 检查实际层数、逻辑层号、KDA/MLA 类型、local expert ID 和 MXFP4 backend；
 5. 记录外部观测到的每卡最大显存。更细的模型构造、dummy quantization、KV cache
-   和首次 forward 分阶段 allocated/reserved 在阶段 2 wrapper 中实现。
+   和首次 forward 分阶段 allocated/reserved 在后续 production profiling 中实现。
 
 通过标准：
 
@@ -406,6 +408,41 @@ profiler 的修正原则是复用上述 public production API，不直接调用 
 KDA/MLA raw cache specs。后续任何绕过标准 Executor、直接构造 model runner 的测试，
 都必须保留同一时序；不得把 standalone harness 缺失的初始化步骤归因于模型 backend
 不受支持。
+
+修正 alignment 后，standalone smoke 已越过原 page-size grouping 错误，但在初始化
+KV cache 时再次失败：`KV cache layout has not been resolved yet`。这是同一类问题的
+下一层表现，而不是新的 Kimi-K3 backend 缺陷。完整 production 顺序还包括：
+
+```text
+load_model()
+    -> update_block_size_for_backend()
+    -> register/get all worker KV cache specs
+    -> get_supported_kv_cache_layouts()
+    -> resolve_kv_cache_layout()
+    -> set_kv_cache_layout() on every worker
+    -> memory profiling and KV cache config
+    -> initialize_from_config()
+```
+
+standalone harness 只拥有单个 runner，无法仅靠逐个补 helper 忠实复刻上述 EngineCore
+与 executor 生命周期。继续修补会得到“能跑的自建 cache”，但不能证明它等价于真实
+推理。因此该 harness 降级为 cache/backend 诊断工具，不再作为正式 forward 或性能
+验收入口。
+
+正式入口改为 `benchmark.py --production-profile`。它直接通过 `LLM` 和 EngineCore
+运行原始 `KimiK3ForConditionalGeneration`，只用公开 `hf_overrides` 将 text decoder
+截断为 12 层，并启用 vLLM 已有的 layerwise NVTX tracing。它明确满足：
+
+- 不使用 `model_class_overrides` 或 `KimiK3BlockProfiler`；
+- 不手工构造 attention metadata、KV cache spec/group/layout；
+- 不直接调用 `KimiDecoderLayer.forward`；
+- 由 production scheduler、executor、worker 和 model runner 执行请求；
+- embedding、末端 norm、LM head 和 sampling 可以执行，但不计入层 0 至 11 的 NVTX
+  block 区间。
+
+第一轮只支持 eager prefill。`max_tokens=1` 使请求完成一次 prefill model execution，
+避免额外 decode forward；prefix caching 关闭。warmup 在 profiling range 外执行，
+正式采集由 CUDA profiler API 开关包围，并由 Nsys 使用该 capture range。
 
 计划在本目录新增：
 
@@ -920,6 +957,7 @@ profile_outputs/
 ├── distributed_smoke/
 ├── model_construction/
 ├── forward_smoke/
+├── production_profile_smoke/
 └── <experiment-name>/
     ├── manifest.json
     ├── run_meta.txt
@@ -1065,6 +1103,9 @@ profile_artifacts: []
 - [x] 验证 block 边界三元状态且不执行模型末端 AttnRes；
 - [x] 定位并修正 standalone forward smoke 缺失 production hybrid-cache block/page
   alignment 的问题；
+- [x] 确认 standalone forward smoke 还缺失 EngineCore 的 KV layout resolution，停止
+  逐项复制 production cache 生命周期；
+- [x] 实现基于 `LLM/EngineCore` 和原始 Kimi 模型的 production profile 入口；
 - [ ] 实现首个 12 层 AttnRes block profiling；
 - [ ] 完成正确性测试；
 - [ ] 完成 TP8/EP8 首轮数据；

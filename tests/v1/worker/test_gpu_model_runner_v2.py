@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.utils.nvtx_pytorch_hooks import PytHooks
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -116,3 +117,27 @@ def test_append_block_ids_rejects_write_past_row_capacity():
         )
 
     assert block_tables.num_blocks.np[0, 1] == 3
+
+
+def test_layerwise_nvtx_hooks_register_once_after_v2_warmup(monkeypatch):
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    runner = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=model_runner_module.CUDAGraphMode.NONE
+        ),
+        layerwise_nvtx_hooks_registered=False,
+        model=model,
+        observability_config=SimpleNamespace(enable_layerwise_nvtx_tracing=True),
+    )
+    registered: list[tuple[torch.nn.Module, str]] = []
+    monkeypatch.setattr(
+        PytHooks,
+        "register_hooks",
+        lambda _self, module, prefix: registered.append((module, prefix)),
+    )
+
+    GPUModelRunner.register_layerwise_nvtx_hooks(runner)
+    GPUModelRunner.register_layerwise_nvtx_hooks(runner)
+
+    assert registered == [(model, "Sequential")]
+    assert runner.layerwise_nvtx_hooks_registered is True

@@ -178,6 +178,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculative_config is not None and self.speculative_config.use_dspark()
         )
         self.observability_config = vllm_config.observability_config
+        self.layerwise_nvtx_hooks_registered = False
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
@@ -363,6 +364,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # on the last PP rank.
             tasks.extend(PoolingRunner.get_supported_tasks(self.model))
         return tuple(tasks)
+
+    def register_layerwise_nvtx_hooks(self) -> None:
+        if (
+            not self.observability_config.enable_layerwise_nvtx_tracing
+            or self.layerwise_nvtx_hooks_registered
+        ):
+            return
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            logger.warning_once(
+                "Layerwise NVTX tracing with the V2 model runner requires "
+                "CUDA graphs to be disabled; some model markers may be missing"
+            )
+
+        from vllm.utils.nvtx_pytorch_hooks import PytHooks
+
+        PytHooks().register_hooks(self.model, self.model.__class__.__name__)
+        self.layerwise_nvtx_hooks_registered = True
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()

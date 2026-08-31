@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run one untimed eager forward of the real 12-layer block",
     )
+    parser.add_argument(
+        "--production-profile",
+        action="store_true",
+        help="Profile the production EngineCore path with 12 real Kimi layers",
+    )
     parser.add_argument("--list-layer-types", action="store_true")
     parser.add_argument("--manifest-out", type=Path)
     parser.add_argument("--phase", choices=("prefill", "decode"))
@@ -109,12 +114,16 @@ def run(argv: Sequence[str] | None = None) -> int:
             args.list_layer_types,
             args.model_construction_smoke,
             args.forward_smoke,
+            args.production_profile,
         )
     )
     if selected_modes != 1:
         raise SystemExit("Select exactly one execution mode")
     if (
-        args.distributed_smoke or args.model_construction_smoke or args.forward_smoke
+        args.distributed_smoke
+        or args.model_construction_smoke
+        or args.forward_smoke
+        or args.production_profile
     ) and args.manifest_out is not None:
         raise SystemExit("--manifest-out is not supported with GPU smoke modes")
     if args.manifest_out is not None:
@@ -146,6 +155,13 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
 
         run_forward_smoke(result.config)
+        return 0
+    if args.production_profile:
+        from benchmarks.kimi_k3_layer_profiling.production_profile import (
+            run_production_profile,
+        )
+
+        run_production_profile(result.config)
         return 0
     print(result.to_json())
     return 0

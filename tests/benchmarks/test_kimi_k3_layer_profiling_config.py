@@ -28,6 +28,11 @@ from benchmarks.kimi_k3_layer_profiling.model_construction import (
     engine_args_kwargs,
     validate_model_construction_config,
 )
+from benchmarks.kimi_k3_layer_profiling.production_profile import (
+    production_engine_args_kwargs,
+    production_profile_evidence,
+    validate_production_profile_config,
+)
 
 ROOT = Path(__file__).parents[2]
 SMOKE_CONFIG = ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml"
@@ -214,6 +219,58 @@ def test_forward_smoke_cli_is_explicit() -> None:
     args = parse_args(["--config", str(SMOKE_CONFIG), "--forward-smoke"])
 
     assert args.forward_smoke
+
+
+def test_production_profile_uses_engine_core_without_model_override() -> None:
+    config = dry_run(_smoke_data()).config
+
+    kwargs = production_engine_args_kwargs(config)
+
+    assert kwargs["hf_overrides"] == {"text_config": {"num_hidden_layers": 12}}
+    assert kwargs["enable_layerwise_nvtx_tracing"] is True
+    assert kwargs["enforce_eager"] is True
+    assert kwargs["enable_prefix_caching"] is False
+    assert "model_class_overrides" not in kwargs
+    assert "enable_prompt_embeds" not in kwargs
+
+
+def test_production_profile_evidence_rejects_custom_execution_paths() -> None:
+    evidence = production_profile_evidence(dry_run(_smoke_data()).config)
+
+    assert evidence["execution_path"] == "LLM/EngineCore/production_model"
+    assert evidence["expected_layer_range"] == [0, 11]
+    assert evidence["uses_custom_block_wrapper"] is False
+    assert evidence["uses_manual_kv_cache_init"] is False
+    assert evidence["model_class_override"] is False
+
+
+def test_production_profile_cli_is_explicit() -> None:
+    args = parse_args(["--config", str(SMOKE_CONFIG), "--production-profile"])
+
+    assert args.production_profile
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"phase": "decode"}, "supports prefill only"),
+        ({"context_len": 256}, "context_len=query_len"),
+        ({"execution_mode": "cudagraph"}, "requires execution_mode=eager"),
+        (
+            {"num_layers": 8, "diagnostic_partial_block": True},
+            "formal 12-layer block",
+        ),
+        ({"profile": "torch"}, "profile=none or profile=cuda"),
+    ],
+)
+def test_production_profile_rejects_nonformal_modes(
+    overrides: dict[str, object], message: str
+) -> None:
+    data = _smoke_data()
+    data.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        validate_production_profile_config(dry_run(data).config)
 
 
 def test_forward_smoke_requires_clean_tracked_files(
