@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,12 @@ from benchmarks.kimi_k3_layer_profiling.config import (
     load_yaml,
 )
 from benchmarks.kimi_k3_layer_profiling.distributed import parallel_config_kwargs
+from benchmarks.kimi_k3_layer_profiling.forward_smoke import (
+    ensure_tracked_worktree_clean,
+    expected_all2all_manager_class,
+    forward_engine_args_kwargs,
+    validate_forward_smoke_config,
+)
 from benchmarks.kimi_k3_layer_profiling.model_construction import (
     MODEL_CLASS_OVERRIDES,
     engine_args_kwargs,
@@ -189,6 +196,62 @@ def test_model_construction_rejects_diagnostic_layer_count() -> None:
 
     with pytest.raises(ValueError, match="formal 12-layer block"):
         validate_model_construction_config(dry_run(data).config)
+
+
+def test_forward_smoke_uses_prompt_embeds_with_production_engine_config() -> None:
+    config = dry_run(_smoke_data()).config
+    expected = engine_args_kwargs(config)
+    expected["enable_prompt_embeds"] = True
+
+    assert forward_engine_args_kwargs(config) == expected
+
+
+def test_forward_smoke_cli_is_explicit() -> None:
+    args = parse_args(["--config", str(SMOKE_CONFIG), "--forward-smoke"])
+
+    assert args.forward_smoke
+
+
+def test_forward_smoke_requires_clean_tracked_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results: list[subprocess.CompletedProcess[str]] = [
+        subprocess.CompletedProcess(["git", "diff"], 0),
+        subprocess.CompletedProcess(["git", "diff", "--cached"], 1),
+    ]
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: results.pop(0))
+
+    with pytest.raises(RuntimeError, match="Git index has uncommitted changes"):
+        ensure_tracked_worktree_clean()
+
+
+@pytest.mark.parametrize("backend", ("allgather_reducescatter", "naive"))
+def test_forward_smoke_validates_ag_rs_backend(backend: str) -> None:
+    assert expected_all2all_manager_class(backend) == "AgRsAll2AllManager"
+
+
+def test_forward_smoke_rejects_unknown_backend_evidence() -> None:
+    with pytest.raises(ValueError, match="cannot validate all2all backend"):
+        expected_all2all_manager_class("unknown")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"execution_mode": "cudagraph"}, "execution_mode=eager"),
+        ({"phase": "decode"}, "supports prefill only"),
+        ({"context_len": 256}, "context_len=query_len"),
+        ({"cache_mode": "prefix"}, "cache_mode=none"),
+    ],
+)
+def test_forward_smoke_rejects_unsupported_modes(
+    overrides: dict[str, object], message: str
+) -> None:
+    data = _smoke_data()
+    data.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        validate_forward_smoke_config(dry_run(data).config)
 
 
 @pytest.mark.parametrize(

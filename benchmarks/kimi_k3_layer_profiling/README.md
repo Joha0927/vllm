@@ -110,7 +110,7 @@ checkpoint 的 router、激活值或生成质量。报告统一标记为
 项目按以下四级验收推进，内部仍拆成七个实施阶段：
 
 | 验收级别 | 目标 | 对应阶段 |
-|---|---|---|
+| --- | --- | --- |
 | A：能运行 | 首个 12 层 block 可初始化并 forward | 0-1 |
 | B：结构正确 | block 边界、层类型、AttnRes 状态和 backend 正确 | 2-4 |
 | C：负载稳定 | shape、routing、rank 和计时可复现 | 5 |
@@ -138,7 +138,7 @@ checkpoint 的 router、激活值或生成质量。报告统一标记为
 验证位置按依赖划分：
 
 | 验证内容 | 默认位置 | 原因 |
-|---|---|---|
+| --- | --- | --- |
 | 配置解析、CLI、dry-run、manifest schema | 本地 | 不依赖 GPU |
 | 逻辑层/block 分类、范围和 AttnRes 深度计算 | 本地 | 可由 config 和纯 Python 验证 |
 | tiny config parity、CPU 单元测试 | 本地 | 成本低，反馈快 |
@@ -187,7 +187,8 @@ nsys --version
 
 验证位置：服务器（硬件与运行环境基线无法由本地替代）。
 
-1. 将以上命令的完整输出保存到 `profile_outputs/<commit>/env/`；
+1. 将以上命令的完整输出保存到 `profile_outputs/env/`，并在环境记录中写入
+   `git rev-parse HEAD` 的结果；
 2. 确认 `torch.cuda.device_count() == 8`，每张卡名称包含 `H20`，capability 为
    `(9, 0)`；
 3. 确认当前分支和 commit 与 GitHub 发布版本一致；
@@ -789,7 +790,7 @@ priming 必须真实经过同一个 block 的 KV/KDA state 写入路径。完成
 speculative workload：
 
 | ID | Phase | B | 每请求 Q | 每请求 K | M |
-|---|---|---:|---:|---:|---:|
+| --- | --- | ---: | ---: | ---: | ---: |
 | P1 | prefill | 1 | 128 | 128 | 128 |
 | P2 | prefill | 1 | 2048 | 2048 | 2048 |
 | P3 | prefill | 8 | 256 | 256 | 2048 |
@@ -818,7 +819,7 @@ M = 255, 256, 257
 固定使用 8 张 GPU 时，优先测试：
 
 | TP | DP | EP | Attention | Experts |
-|---:|---:|---:|---|---|
+| ---: | ---: | ---: | --- | --- |
 | 8 | 1 | 8 | TP8 | EP8 |
 | 4 | 2 | 8 | 每个 DP group 内 TP4 | EP8 |
 | 2 | 4 | 8 | 每个 DP group 内 TP2 | EP8 |
@@ -877,20 +878,33 @@ export VLLM_RANDOMIZE_DP_DUMMY_INPUTS=1
 服务器覆盖配置必须是 untracked 文件，且 benchmark 将合并后的最终配置写入
 manifest。
 
-建议服务器结果目录：
+服务器结果目录不得按 Git commit 分层。所有阶段统一直接使用实验名称组织目录，
+Git commit 写入 manifest、`run_meta.txt` 和最终 PASS/FAIL 记录，用于追溯运行代码。
+建议目录结构：
 
 ```text
 profile_outputs/
-└── <git-commit>/
-    └── <experiment-name>/
-        ├── manifest.json
-        ├── rank_0.json
-        ├── rank_1.json
-        ├── ...
-        ├── summary.json
-        ├── summary.md
-        └── traces/
+├── env/
+├── distributed_smoke/
+├── model_construction/
+├── forward_smoke/
+└── <experiment-name>/
+    ├── manifest.json
+    ├── run_meta.txt
+    ├── rank_0.json
+    ├── rank_1.json
+    ├── ...
+    ├── summary.json
+    ├── summary.md
+    └── traces/
 ```
+
+后续所有阶段均遵守该规则。例如 forward smoke 固定写入
+`profile_outputs/forward_smoke/`，Nsys 实验写入对应的
+`profile_outputs/<experiment-name>/`，不得重新引入
+`profile_outputs/<git-commit>/...`。如果同一实验需要保留多次运行，可在实验目录下
+增加不含 commit 的运行编号或时间戳子目录；每次运行仍必须在 manifest 中记录完整
+40 位 Git commit。
 
 以下内容不得提交：
 

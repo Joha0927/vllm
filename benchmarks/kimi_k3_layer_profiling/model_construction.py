@@ -48,7 +48,7 @@ def validate_model_construction_config(config: BenchmarkConfig) -> None:
         raise ValueError("Model construction smoke requires the formal 12-layer block")
 
 
-def _git_commit() -> str:
+def git_commit() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         check=True,
@@ -61,7 +61,7 @@ def _git_commit() -> str:
     return commit
 
 
-def _memory_mib(torch_module) -> dict[str, float]:
+def memory_mib(torch_module) -> dict[str, float]:
     return {
         "allocated_mib": torch_module.accelerator.memory_allocated() / 2**20,
         "reserved_mib": torch_module.accelerator.memory_reserved() / 2**20,
@@ -164,10 +164,10 @@ def run_model_construction_smoke(config: BenchmarkConfig) -> None:
     model = None
     block_model = None
     layers = None
-    git_commit = None
+    run_commit = None
     failure_stage = "engine_config"
     try:
-        git_commit = _git_commit()
+        run_commit = git_commit()
         vllm_config = EngineArgs(**engine_args_kwargs(config)).create_engine_config()
         failure_stage = "distributed_init"
         init_distributed_environment()
@@ -175,7 +175,7 @@ def run_model_construction_smoke(config: BenchmarkConfig) -> None:
 
         failure_stage = "configuration_agreement"
         run_identity = hashlib.sha256(
-            benchmark_config_digest(config) + git_commit.encode()
+            benchmark_config_digest(config) + run_commit.encode()
         ).digest()
         digest = torch.tensor(
             list(run_identity),
@@ -197,11 +197,11 @@ def run_model_construction_smoke(config: BenchmarkConfig) -> None:
             )
 
         torch.accelerator.reset_peak_memory_stats()
-        memory_before = _memory_mib(torch)
+        memory_before = memory_mib(torch)
         failure_stage = "dummy_model_loading"
         model = get_model(vllm_config=vllm_config)
         torch.accelerator.synchronize()
-        memory_after = _memory_mib(torch)
+        memory_after = memory_mib(torch)
 
         failure_stage = "model_validation"
         if type(model).__name__ != "KimiK3ForConditionalGeneration":
@@ -290,7 +290,7 @@ def run_model_construction_smoke(config: BenchmarkConfig) -> None:
             "dcp_size": get_dcp_group().world_size,
             "device": current_platform.get_device_name(local_rank),
             "ep_size": get_ep_group().world_size,
-            "git_commit": git_commit,
+            "git_commit": run_commit,
             "layer_indices": layer_indices,
             "layer_types": layer_types,
             "local_rank": local_rank,
@@ -320,7 +320,7 @@ def run_model_construction_smoke(config: BenchmarkConfig) -> None:
             "error_message": str(error),
             "exception_type": type(error).__name__,
             "failure_stage": failure_stage,
-            "git_commit": git_commit,
+            "git_commit": run_commit,
             "local_rank": local_rank,
             "rank": rank,
             "smoke_scope": "real_model_construction",
