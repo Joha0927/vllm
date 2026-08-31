@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -268,12 +269,10 @@ class PytHooks:
             torch.nn.Dropout2d,
             torch.nn.Dropout3d,
         )
-
         for name, module in network_model.named_modules(prefix=module_prefix):
             # Skip certain module types to reduce profiling overhead
             if isinstance(module, skip_types):
                 continue
-
             module.register_forward_pre_hook(self.module_fwd_pre_hook, with_kwargs=True)
             module.register_forward_hook(self.module_fwd_hook)
             if module not in self.module_to_name_map:
@@ -281,3 +280,34 @@ class PytHooks:
             else:
                 raise ValueError("Module instance {} is not unique ".format(module))
         return
+
+
+class PytLayerProfilerHooks:
+    """Add PyTorch profiler scopes around decoder layers."""
+
+    def __init__(self) -> None:
+        self.module_to_name_map: dict[torch.nn.Module, str] = {}
+        self.active_contexts: dict[torch.nn.Module, list[Any]] = {}
+
+    def module_fwd_pre_hook(self, module_obj, _args, _kwargs) -> None:
+        context = torch.profiler.record_function(self.module_to_name_map[module_obj])
+        context.__enter__()
+        self.active_contexts.setdefault(module_obj, []).append(context)
+
+    def module_fwd_hook(self, module_obj, _args, _output) -> None:
+        contexts = self.active_contexts.get(module_obj)
+        if not contexts:
+            raise RuntimeError("Layer profiler hook stack is empty")
+        contexts.pop().__exit__(None, None, None)
+
+    def register_hooks(self, network_model, module_prefix="top") -> int:
+        registered = 0
+        for name, module in network_model.named_modules(prefix=module_prefix):
+            parts = name.split(".")
+            if len(parts) < 2 or parts[-2] != "layers" or not parts[-1].isdigit():
+                continue
+            self.module_to_name_map[module] = name
+            module.register_forward_pre_hook(self.module_fwd_pre_hook, with_kwargs=True)
+            module.register_forward_hook(self.module_fwd_hook, always_call=True)
+            registered += 1
+        return registered

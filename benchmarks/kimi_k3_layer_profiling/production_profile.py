@@ -3,6 +3,7 @@
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from benchmarks.kimi_k3_layer_profiling.config import (
@@ -17,11 +18,15 @@ def validate_production_profile_config(config: BenchmarkConfig) -> None:
     if config.context_len != config.query_len:
         raise ValueError("prefill requires context_len=query_len")
     if config.execution_mode != "eager":
-        raise ValueError("layerwise NVTX profiling requires execution_mode=eager")
-    if config.num_layers != 12 or config.diagnostic_partial_block:
+        raise ValueError("layerwise Torch profiling requires execution_mode=eager")
+    if config.num_layers != 12:
         raise ValueError("production profile requires the formal 12-layer block")
-    if config.profile not in {"none", "cuda"}:
-        raise ValueError("production profile supports profile=none or profile=cuda")
+    if config.profile not in {"none", "torch"}:
+        raise ValueError("production profile supports profile=none or profile=torch")
+    if config.profile == "torch" and not config.profile_output_dir:
+        raise ValueError("profile_output_dir is required when profile=torch")
+    if config.profile == "none" and config.profile_output_dir:
+        raise ValueError("profile_output_dir requires profile=torch")
 
 
 def production_engine_args_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
@@ -33,7 +38,7 @@ def production_engine_args_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
         "disable_log_stats": True,
         "dtype": config.dtype,
         "enable_expert_parallel": config.enable_expert_parallel,
-        "enable_layerwise_nvtx_tracing": True,
+        "enable_layerwise_nvtx_tracing": config.profile == "torch",
         "enable_prefix_caching": False,
         "enforce_eager": True,
         "hf_overrides": {"text_config": {"num_hidden_layers": config.num_layers}},
@@ -50,10 +55,19 @@ def production_engine_args_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
         "skip_tokenizer_init": True,
         "tensor_parallel_size": config.tensor_parallel_size,
     }
-    if config.profile == "cuda":
+    if config.profile == "torch":
         from vllm.config.profiler import ProfilerConfig
 
-        kwargs["profiler_config"] = ProfilerConfig(profiler="cuda")
+        assert config.profile_output_dir is not None
+        profile_output_dir = Path(config.profile_output_dir).resolve()
+        profile_output_dir.mkdir(parents=True, exist_ok=True)
+        kwargs["profiler_config"] = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=str(profile_output_dir),
+            torch_profiler_record_shapes=True,
+            torch_profiler_with_memory=False,
+            torch_profiler_with_stack=False,
+        )
     return kwargs
 
 
@@ -63,10 +77,11 @@ def production_profile_evidence(config: BenchmarkConfig) -> dict[str, Any]:
         "context_len": config.context_len,
         "execution_path": "LLM/EngineCore/production_model",
         "expected_layer_range": [0, config.num_layers - 1],
-        "layerwise_nvtx_tracing": True,
+        "layerwise_profiler_scopes": config.profile == "torch",
         "model_class_override": False,
         "num_layers": config.num_layers,
         "profile": config.profile,
+        "profile_output_dir": config.profile_output_dir,
         "query_len": config.query_len,
         "uses_custom_block_wrapper": False,
         "uses_manual_kv_cache_init": False,
@@ -111,13 +126,13 @@ def run_production_profile(config: BenchmarkConfig) -> None:
     for _ in range(config.warmup_iters):
         generate_once()
 
-    if config.profile == "cuda":
+    if config.profile == "torch":
         llm.start_profile("kimi_k3_first_block")
     try:
         for _ in range(config.profile_iters):
             generate_once()
     finally:
-        if config.profile == "cuda":
+        if config.profile == "torch":
             llm.stop_profile()
 
     print(

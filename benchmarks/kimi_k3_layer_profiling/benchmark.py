@@ -27,14 +27,12 @@ _OVERRIDE_FIELDS = (
     "all2all_backend",
     "execution_mode",
     "routing_strategy",
-    "cache_mode",
     "warmup_iters",
     "profile_iters",
-    "repeat_iters",
     "profile",
+    "profile_output_dir",
     "gpu_count",
     "random_seed",
-    "diagnostic_partial_block",
 )
 
 
@@ -42,21 +40,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Profile the first Kimi-K3 block")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--distributed-smoke",
-        action="store_true",
-        help="Initialize and validate distributed groups without loading a model",
-    )
-    parser.add_argument(
-        "--model-construction-smoke",
-        action="store_true",
-        help="Construct the real 12-layer block without running forward",
-    )
-    parser.add_argument(
-        "--forward-smoke",
-        action="store_true",
-        help="Run one untimed eager forward of the real 12-layer block",
-    )
     parser.add_argument(
         "--production-profile",
         action="store_true",
@@ -80,18 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all2all-backend")
     parser.add_argument("--execution-mode", choices=("eager", "cudagraph"))
     parser.add_argument("--routing-strategy")
-    parser.add_argument("--cache-mode")
     parser.add_argument("--warmup-iters", type=int)
     parser.add_argument("--profile-iters", type=int)
-    parser.add_argument("--repeat-iters", type=int)
-    parser.add_argument("--profile", choices=("none", "torch", "cuda", "proton"))
+    parser.add_argument("--profile", choices=("none", "torch"))
+    parser.add_argument("--profile-output-dir")
     parser.add_argument("--gpu-count", type=int)
     parser.add_argument("--random-seed", type=int)
-    parser.add_argument(
-        "--diagnostic-partial-block",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
     return parser
 
 
@@ -110,21 +87,13 @@ def run(argv: Sequence[str] | None = None) -> int:
     selected_modes = sum(
         (
             args.dry_run,
-            args.distributed_smoke,
             args.list_layer_types,
-            args.model_construction_smoke,
-            args.forward_smoke,
             args.production_profile,
         )
     )
     if selected_modes != 1:
         raise SystemExit("Select exactly one execution mode")
-    if (
-        args.distributed_smoke
-        or args.model_construction_smoke
-        or args.forward_smoke
-        or args.production_profile
-    ) and args.manifest_out is not None:
+    if args.production_profile and args.manifest_out is not None:
         raise SystemExit("--manifest-out is not supported with GPU smoke modes")
     if args.manifest_out is not None:
         args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
@@ -134,27 +103,6 @@ def run(argv: Sequence[str] | None = None) -> int:
         )
     if args.list_layer_types:
         print(json.dumps([asdict(layer) for layer in result.layers], indent=2))
-        return 0
-    if args.distributed_smoke:
-        from benchmarks.kimi_k3_layer_profiling.distributed import (
-            run_distributed_smoke,
-        )
-
-        run_distributed_smoke(result.config)
-        return 0
-    if args.model_construction_smoke:
-        from benchmarks.kimi_k3_layer_profiling.model_construction import (
-            run_model_construction_smoke,
-        )
-
-        run_model_construction_smoke(result.config)
-        return 0
-    if args.forward_smoke:
-        from benchmarks.kimi_k3_layer_profiling.forward_smoke import (
-            run_forward_smoke,
-        )
-
-        run_forward_smoke(result.config)
         return 0
     if args.production_profile:
         from benchmarks.kimi_k3_layer_profiling.production_profile import (

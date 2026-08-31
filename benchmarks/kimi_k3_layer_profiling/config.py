@@ -8,31 +8,27 @@ from typing import Any
 
 import yaml
 
-
 _PHASES = {"prefill", "decode"}
-_PROFILES = {"none", "torch", "cuda", "proton"}
+_PROFILES = {"none", "torch"}
 _EXECUTION_MODES = {"eager", "cudagraph"}
-_DIAGNOSTIC_LAYER_COUNTS = {1, 4, 8, 12}
 _MODEL_CONFIG_DIR = "benchmarks/kimi_k3_layer_profiling/model_config"
 _LOGICAL_START_LAYER = 0
 _CONFIG_FIELDS = {
     "all2all_backend",
     "batch_size",
-    "cache_mode",
     "context_len",
     "data_parallel_size",
     "decode_context_parallel_size",
-    "diagnostic_partial_block",
     "enable_expert_parallel",
     "execution_mode",
     "gpu_count",
     "num_layers",
     "phase",
     "profile",
+    "profile_output_dir",
     "profile_iters",
     "query_len",
     "random_seed",
-    "repeat_iters",
     "routing_strategy",
     "tensor_parallel_size",
     "warmup_iters",
@@ -67,14 +63,12 @@ class BenchmarkConfig:
     all2all_backend: str
     execution_mode: str
     routing_strategy: str
-    cache_mode: str
     warmup_iters: int
     profile_iters: int
-    repeat_iters: int
     profile: str
+    profile_output_dir: str | None
     gpu_count: int
     random_seed: int
-    diagnostic_partial_block: bool = False
 
     @property
     def num_scheduled_tokens(self) -> int:
@@ -121,14 +115,7 @@ class DryRunResult:
         config = self.config
         return {
             "all2all_backend": config.all2all_backend,
-            "applies_model_output_attn_res": False,
             "batch_size": config.batch_size,
-            "block_output_contract": [
-                "pending_hidden_states",
-                "prefix_sum",
-                "block_residual_bank",
-            ],
-            "cache_mode": config.cache_mode,
             "context_lengths": [config.context_len] * config.batch_size,
             "data_parallel_size": config.data_parallel_size,
             "decode_context_parallel_size": config.decode_context_parallel_size,
@@ -143,7 +130,8 @@ class DryRunResult:
                 config.logical_start_layer + config.num_layers - 1,
             ],
             "logical_start_layer": config.logical_start_layer,
-            "measurement_fidelity": "shape-faithful/backend-faithful",
+            "execution_path": "LLM/EngineCore/production_model",
+            "measurement_fidelity": "production-path/shape/backend-faithful",
             "model": "moonshotai/Kimi-K3",
             "model_config_source": str(Path(config.model) / "config.json"),
             "num_profiled_layers": config.num_layers,
@@ -153,11 +141,11 @@ class DryRunResult:
             "physical_layer_index": config.logical_start_layer,
             "physical_start_layer": config.logical_start_layer,
             "profile": config.profile,
+            "profile_output_dir": config.profile_output_dir,
             "profile_iters": config.profile_iters,
             "profiling_unit": "block",
             "query_lengths": [config.query_len] * config.batch_size,
             "random_seed": config.random_seed,
-            "repeat_iters": config.repeat_iters,
             "routing_strategy": config.routing_strategy,
             "tensor_parallel_size": config.tensor_parallel_size,
             "warmup_iters": config.warmup_iters,
@@ -226,23 +214,21 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
         num_layers=int(data.get("num_layers", 12)),
         tensor_parallel_size=int(data.get("tensor_parallel_size", 8)),
         data_parallel_size=int(data.get("data_parallel_size", 1)),
-        decode_context_parallel_size=int(
-            data.get("decode_context_parallel_size", 1)
-        ),
+        decode_context_parallel_size=int(data.get("decode_context_parallel_size", 1)),
         enable_expert_parallel=bool(data.get("enable_expert_parallel", True)),
-        all2all_backend=str(
-            data.get("all2all_backend", "allgather_reducescatter")
-        ),
+        all2all_backend=str(data.get("all2all_backend", "allgather_reducescatter")),
         execution_mode=str(data.get("execution_mode", "eager")),
         routing_strategy=str(data.get("routing_strategy", "uniform_random")),
-        cache_mode=str(data.get("cache_mode", "none")),
         warmup_iters=int(data.get("warmup_iters", 1)),
         profile_iters=int(data.get("profile_iters", 1)),
-        repeat_iters=int(data.get("repeat_iters", 1)),
         profile=str(data.get("profile", "none")),
+        profile_output_dir=(
+            str(data["profile_output_dir"])
+            if data.get("profile_output_dir") is not None
+            else None
+        ),
         gpu_count=int(data.get("gpu_count", 8)),
         random_seed=int(data.get("random_seed", 0)),
-        diagnostic_partial_block=bool(data.get("diagnostic_partial_block", False)),
     )
     validate_config(config)
     return config
@@ -254,9 +240,7 @@ def validate_config(config: BenchmarkConfig) -> None:
     if config.profile not in _PROFILES:
         raise ValueError(f"profile must be one of {sorted(_PROFILES)}")
     if config.execution_mode not in _EXECUTION_MODES:
-        raise ValueError(
-            f"execution_mode must be one of {sorted(_EXECUTION_MODES)}"
-        )
+        raise ValueError(f"execution_mode must be one of {sorted(_EXECUTION_MODES)}")
     for field_name in (
         "batch_size",
         "query_len",
@@ -274,25 +258,17 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("warmup_iters must be non-negative")
     if config.profile_iters <= 0:
         raise ValueError("profile_iters must be positive")
-    if config.repeat_iters <= 0:
-        raise ValueError("repeat_iters must be positive")
     if config.random_seed < 0:
         raise ValueError("random_seed must be non-negative")
     if config.context_len < config.query_len:
         raise ValueError("context_len must be greater than or equal to query_len")
-    if config.diagnostic_partial_block:
-        if config.num_layers not in _DIAGNOSTIC_LAYER_COUNTS:
-            raise ValueError("Diagnostic num_layers must be one of 1, 4, 8, or 12")
-    elif config.num_layers != 12:
+    if config.num_layers != 12:
         raise ValueError("Formal block profiling requires exactly 12 layers")
     if config.tensor_parallel_size % config.decode_context_parallel_size != 0:
         raise ValueError(
             "decode_context_parallel_size must divide tensor_parallel_size"
         )
-    if (
-        config.tensor_parallel_size * config.data_parallel_size
-        != config.gpu_count
-    ):
+    if config.tensor_parallel_size * config.data_parallel_size != config.gpu_count:
         raise ValueError(
             "tensor_parallel_size * data_parallel_size must equal gpu_count"
         )
@@ -339,9 +315,7 @@ def dry_run(data: dict[str, Any]) -> DryRunResult:
     return DryRunResult(config=config, layers=describe_layers(config))
 
 
-def apply_overrides(
-    data: dict[str, Any], overrides: dict[str, Any]
-) -> dict[str, Any]:
+def apply_overrides(data: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     merged = dict(data)
     merged.update({key: value for key, value in overrides.items() if value is not None})
     return merged
