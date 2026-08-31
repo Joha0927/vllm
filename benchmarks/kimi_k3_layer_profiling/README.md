@@ -444,6 +444,35 @@ standalone harness 只拥有单个 runner，无法仅靠逐个补 helper 忠实�
 避免额外 decode forward；prefix caching 关闭。warmup 在 profiling range 外执行，
 正式采集由 CUDA profiler API 开关包围，并由 Nsys 使用该 capture range。
 
+#### Production forward smoke 实测记录（2026-08-31）
+
+验收 commit：`8e559897cc3f4b94608bf79bbbf46c4b4d3c2788`。
+
+单机 8×H20 上的 production forward smoke 已通过，结论为
+`PASS WITH WARNING`。本次运行直接使用 `LLM/EngineCore/production_model`，没有
+model-class override、自定义 block wrapper 或手工 KV cache 初始化。实际配置为 12 层、
+TP8、DP1、EP8、DCP1、BF16、dummy MXFP4 weights、eager，以及 uniform-random MoE
+routing simulation。
+
+production EngineCore 已完成 hybrid cache 的全部正式生命周期：8 个 worker 均将
+attention block size 调整为 768 tokens，将 Mamba page padding 到相同 page size，解析
+出 `LBNHC` KV layout，并成功创建固定 4 GiB/GPU 的 KV cache。cache 容量为 52180
+tokens。此前 standalone harness 暴露的 page-size unify 和 unresolved-layout 错误均未
+再次出现。
+
+forward 最终输出 `stage=complete, status=PASS`，worker graceful exit，进程退出码为
+0，退出后 8 张 GPU 均为 0 MiB。当前已证明层范围 0 至 11 被配置并由 production
+model 执行；实际 NVTX marker 是否完整覆盖且仅覆盖 `layers.0..11` 留给下一步 Nsys
+smoke 验证。
+
+唯一 warning 是 renderer 在启用 `skip_tokenizer_init=True` 时尝试 chat-template
+warmup，因 tokenizer 不存在而打印被捕获的 traceback。该 warning 发生在 frontend
+warmup，被框架捕获后 EngineCore、KV cache 和 forward 均继续成功，因此不判为模型、
+CUDA、NCCL 或 cache failure。shutdown 中的 EngineCore force-kill 也发生在所有 worker
+已 graceful exit 且显存已释放之后，本轮不作为失败。后续日志验收不能再用“不含任何
+`Traceback`”作为机械条件，应按 traceback 的来源和是否影响最终 RC/worker/forward
+状态分类。
+
 计划在本目录新增：
 
 ```text
