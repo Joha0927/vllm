@@ -1,12 +1,12 @@
 # Required workload inputs.
-workload: full_prefill
-batch_size: 1
-history_len: 0
-query_len: 128
+workload: prefill_decode
+batch_size: 8
+history_len: 16384
+query_len: 1
 
 # Optional execution inputs. Defaults are written explicitly for reproducibility.
-tensor_parallel_size: 8
-data_parallel_size: 1
+tensor_parallel_size: 1
+data_parallel_size: 8
 decode_context_parallel_size: 1
 enable_expert_parallel: true
 all2all_backend: allgather_reducescatter
@@ -22,7 +22,7 @@ kv_cache_memory_bytes: 4294967296
 shard_sp_shared_expert: false
 execution_mode: eager
 routing_strategy: uniform_random
-warmup_iters: 1
+warmup_iters: 3
 profile_iters: 1
 profile: none
 gpu_count: 8

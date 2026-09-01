@@ -15,16 +15,25 @@ from benchmarks.kimi_k3_layer_profiling.config import (
 )
 
 _OVERRIDE_FIELDS = (
-    "phase",
+    "workload",
     "batch_size",
+    "history_len",
     "query_len",
-    "context_len",
-    "num_layers",
     "tensor_parallel_size",
     "data_parallel_size",
     "decode_context_parallel_size",
     "enable_expert_parallel",
     "all2all_backend",
+    "expert_placement_strategy",
+    "enable_dbo",
+    "moe_backend",
+    "linear_backend",
+    "attention_backend",
+    "kda_prefill_backend",
+    "mla_prefill_backend",
+    "kv_cache_dtype",
+    "kv_cache_memory_bytes",
+    "shard_sp_shared_expert",
     "execution_mode",
     "routing_strategy",
     "warmup_iters",
@@ -47,11 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--list-layer-types", action="store_true")
     parser.add_argument("--manifest-out", type=Path)
-    parser.add_argument("--phase", choices=("prefill", "decode"))
+    parser.add_argument(
+        "--workload",
+        choices=("full_prefill", "extend_prefill", "prefill_decode"),
+    )
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--history-len", type=int)
     parser.add_argument("--query-len", type=int)
-    parser.add_argument("--context-len", type=int)
-    parser.add_argument("--num-layers", type=int)
     parser.add_argument("--tensor-parallel-size", type=int)
     parser.add_argument("--data-parallel-size", type=int)
     parser.add_argument("--decode-context-parallel-size", type=int)
@@ -61,6 +72,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--all2all-backend")
+    parser.add_argument(
+        "--expert-placement-strategy", choices=("linear", "round_robin")
+    )
+    parser.add_argument(
+        "--enable-dbo",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--moe-backend")
+    parser.add_argument("--linear-backend")
+    parser.add_argument("--attention-backend")
+    parser.add_argument("--kda-prefill-backend", choices=("auto", "triton", "flashkda"))
+    parser.add_argument(
+        "--mla-prefill-backend",
+        choices=(
+            "auto",
+            "flash_attn",
+            "flashinfer",
+            "tokenspeed_mla",
+            "trtllm_ragged",
+        ),
+    )
+    parser.add_argument("--kv-cache-dtype")
+    parser.add_argument("--kv-cache-memory-bytes", type=int)
+    parser.add_argument(
+        "--shard-sp-shared-expert",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--execution-mode", choices=("eager", "cudagraph"))
     parser.add_argument("--routing-strategy")
     parser.add_argument("--warmup-iters", type=int)

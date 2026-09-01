@@ -8,31 +8,53 @@ from typing import Any
 
 import yaml
 
-_PHASES = {"prefill", "decode"}
+_WORKLOADS = {"extend_prefill", "full_prefill", "prefill_decode"}
 _PROFILES = {"none", "torch"}
 _EXECUTION_MODES = {"eager", "cudagraph"}
 _MODEL_CONFIG_DIR = "benchmarks/kimi_k3_layer_profiling/model_config"
 _LOGICAL_START_LAYER = 0
-_CONFIG_FIELDS = {
-    "all2all_backend",
+_NUM_LAYERS = 12
+_REQUIRED_CONFIG_FIELDS = {
     "batch_size",
-    "context_len",
-    "data_parallel_size",
-    "decode_context_parallel_size",
-    "enable_expert_parallel",
-    "execution_mode",
-    "gpu_count",
-    "num_layers",
-    "phase",
-    "profile",
-    "profile_output_dir",
-    "profile_iters",
+    "history_len",
     "query_len",
-    "random_seed",
-    "routing_strategy",
-    "tensor_parallel_size",
-    "warmup_iters",
+    "workload",
 }
+_CONFIG_DEFAULTS: dict[str, Any] = {
+    "all2all_backend": "allgather_reducescatter",
+    "attention_backend": "auto",
+    "data_parallel_size": 1,
+    "decode_context_parallel_size": 1,
+    "enable_dbo": False,
+    "enable_expert_parallel": True,
+    "execution_mode": "eager",
+    "expert_placement_strategy": "linear",
+    "gpu_count": 8,
+    "kda_prefill_backend": "auto",
+    "kv_cache_dtype": "auto",
+    "kv_cache_memory_bytes": 4 * 1024**3,
+    "linear_backend": "auto",
+    "mla_prefill_backend": "auto",
+    "moe_backend": "auto",
+    "profile": "none",
+    "profile_iters": 1,
+    "profile_output_dir": None,
+    "random_seed": 0,
+    "routing_strategy": "uniform_random",
+    "shard_sp_shared_expert": False,
+    "tensor_parallel_size": 8,
+    "warmup_iters": 1,
+}
+_CONFIG_FIELDS = _REQUIRED_CONFIG_FIELDS | _CONFIG_DEFAULTS.keys()
+_KDA_PREFILL_BACKENDS = {"auto", "flashkda", "triton"}
+_MLA_PREFILL_BACKENDS = {
+    "auto",
+    "flash_attn",
+    "flashinfer",
+    "tokenspeed_mla",
+    "trtllm_ragged",
+}
+_EXPERT_PLACEMENT_STRATEGIES = {"linear", "round_robin"}
 
 
 @dataclass(frozen=True)
@@ -47,10 +69,10 @@ class LayerDescription:
 @dataclass(frozen=True)
 class BenchmarkConfig:
     model: str
-    phase: str
+    workload: str
     batch_size: int
+    history_len: int
     query_len: int
-    context_len: int
     hidden_size: int
     dtype: str
     weight_format: str
@@ -61,6 +83,16 @@ class BenchmarkConfig:
     decode_context_parallel_size: int
     enable_expert_parallel: bool
     all2all_backend: str
+    expert_placement_strategy: str
+    enable_dbo: bool
+    moe_backend: str
+    linear_backend: str
+    attention_backend: str
+    kda_prefill_backend: str
+    mla_prefill_backend: str
+    kv_cache_dtype: str
+    kv_cache_memory_bytes: int
+    shard_sp_shared_expert: bool
     execution_mode: str
     routing_strategy: str
     warmup_iters: int
@@ -75,6 +107,24 @@ class BenchmarkConfig:
         return self.batch_size * self.query_len
 
     @property
+    def prompt_len(self) -> int:
+        if self.workload == "prefill_decode":
+            return self.history_len
+        return self.query_len
+
+    @property
+    def max_tokens(self) -> int:
+        return 2 if self.workload == "prefill_decode" else 1
+
+    @property
+    def max_model_len(self) -> int:
+        return self.prompt_len + self.max_tokens
+
+    @property
+    def prefill_tokens(self) -> int:
+        return self.batch_size * self.prompt_len
+
+    @property
     def input_shape(self) -> tuple[int, int, int]:
         return (self.batch_size, self.query_len, self.hidden_size)
 
@@ -87,6 +137,10 @@ class BenchmarkConfig:
         if not self.enable_expert_parallel:
             return 1
         return self.tensor_parallel_size * self.data_parallel_size
+
+    @property
+    def local_batch_size(self) -> int:
+        return self.batch_size // self.data_parallel_size
 
 
 @dataclass(frozen=True)
@@ -115,13 +169,17 @@ class DryRunResult:
         config = self.config
         return {
             "all2all_backend": config.all2all_backend,
+            "attention_backend": config.attention_backend,
             "batch_size": config.batch_size,
-            "context_lengths": [config.context_len] * config.batch_size,
+            "context_lengths": [config.prompt_len] * config.batch_size,
             "data_parallel_size": config.data_parallel_size,
             "decode_context_parallel_size": config.decode_context_parallel_size,
             "dtype": config.dtype,
             "execution_mode": config.execution_mode,
+            "enable_dbo": config.enable_dbo,
+            "enable_expert_parallel": config.enable_expert_parallel,
             "expert_parallel_size": config.expert_parallel_size,
+            "expert_placement_strategy": config.expert_placement_strategy,
             "git_commit": None,
             "gpu_count": config.gpu_count,
             "input_shape": list(config.input_shape),
@@ -130,14 +188,24 @@ class DryRunResult:
                 config.logical_start_layer + config.num_layers - 1,
             ],
             "logical_start_layer": config.logical_start_layer,
+            "local_batch_size": config.local_batch_size,
+            "kda_prefill_backend": config.kda_prefill_backend,
+            "kv_cache_dtype": config.kv_cache_dtype,
+            "kv_cache_memory_bytes": config.kv_cache_memory_bytes,
+            "linear_backend": config.linear_backend,
             "execution_path": "LLM/EngineCore/production_model",
             "measurement_fidelity": "production-path/shape/backend-faithful",
             "model": "moonshotai/Kimi-K3",
             "model_config_source": str(Path(config.model) / "config.json"),
+            "mla_prefill_backend": config.mla_prefill_backend,
+            "moe_backend": config.moe_backend,
             "num_profiled_layers": config.num_layers,
             "num_scheduled_tokens": config.num_scheduled_tokens,
+            "prefill_tokens": config.prefill_tokens,
             "packed_shape": list(config.packed_shape),
-            "phase": config.phase,
+            "history_len": config.history_len,
+            "max_model_len": config.max_model_len,
+            "max_tokens": config.max_tokens,
             "physical_layer_index": config.logical_start_layer,
             "physical_start_layer": config.logical_start_layer,
             "profile": config.profile,
@@ -147,10 +215,12 @@ class DryRunResult:
             "query_lengths": [config.query_len] * config.batch_size,
             "random_seed": config.random_seed,
             "routing_strategy": config.routing_strategy,
+            "shard_sp_shared_expert": config.shard_sp_shared_expert,
             "tensor_parallel_size": config.tensor_parallel_size,
             "warmup_iters": config.warmup_iters,
             "weight_format": config.weight_format,
             "weight_source": "dummy",
+            "workload": config.workload,
         }
 
     def to_json(self) -> str:
@@ -190,8 +260,7 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
     unsupported = sorted(data.keys() - _CONFIG_FIELDS)
     if unsupported:
         raise ValueError(f"Unsupported config fields: {', '.join(unsupported)}")
-    required = {"phase", "batch_size", "query_len", "context_len"}
-    missing = sorted(required - data.keys())
+    missing = sorted(_REQUIRED_CONFIG_FIELDS - data.keys())
     if missing:
         raise ValueError(f"Missing required fields: {', '.join(missing)}")
 
@@ -201,42 +270,57 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
     if not isinstance(quantization_config, dict):
         raise ValueError("The model config does not define quantization_config")
 
+    values = {**_CONFIG_DEFAULTS, **data}
     config = BenchmarkConfig(
         model=_MODEL_CONFIG_DIR,
-        phase=str(data["phase"]),
-        batch_size=int(data["batch_size"]),
-        query_len=int(data["query_len"]),
-        context_len=int(data["context_len"]),
+        workload=str(values["workload"]),
+        batch_size=int(values["batch_size"]),
+        history_len=int(values["history_len"]),
+        query_len=int(values["query_len"]),
         hidden_size=int(text_config["hidden_size"]),
         dtype=str(model_config["dtype"]),
         weight_format=str(quantization_config["format"]),
         logical_start_layer=_LOGICAL_START_LAYER,
-        num_layers=int(data.get("num_layers", 12)),
-        tensor_parallel_size=int(data.get("tensor_parallel_size", 8)),
-        data_parallel_size=int(data.get("data_parallel_size", 1)),
-        decode_context_parallel_size=int(data.get("decode_context_parallel_size", 1)),
-        enable_expert_parallel=bool(data.get("enable_expert_parallel", True)),
-        all2all_backend=str(data.get("all2all_backend", "allgather_reducescatter")),
-        execution_mode=str(data.get("execution_mode", "eager")),
-        routing_strategy=str(data.get("routing_strategy", "uniform_random")),
-        warmup_iters=int(data.get("warmup_iters", 1)),
-        profile_iters=int(data.get("profile_iters", 1)),
-        profile=str(data.get("profile", "none")),
+        num_layers=_NUM_LAYERS,
+        tensor_parallel_size=int(values["tensor_parallel_size"]),
+        data_parallel_size=int(values["data_parallel_size"]),
+        decode_context_parallel_size=int(values["decode_context_parallel_size"]),
+        enable_expert_parallel=_require_bool(
+            values["enable_expert_parallel"], "enable_expert_parallel"
+        ),
+        all2all_backend=str(values["all2all_backend"]),
+        expert_placement_strategy=str(values["expert_placement_strategy"]),
+        enable_dbo=_require_bool(values["enable_dbo"], "enable_dbo"),
+        moe_backend=str(values["moe_backend"]),
+        linear_backend=str(values["linear_backend"]),
+        attention_backend=str(values["attention_backend"]),
+        kda_prefill_backend=str(values["kda_prefill_backend"]),
+        mla_prefill_backend=str(values["mla_prefill_backend"]),
+        kv_cache_dtype=str(values["kv_cache_dtype"]),
+        kv_cache_memory_bytes=int(values["kv_cache_memory_bytes"]),
+        shard_sp_shared_expert=_require_bool(
+            values["shard_sp_shared_expert"], "shard_sp_shared_expert"
+        ),
+        execution_mode=str(values["execution_mode"]),
+        routing_strategy=str(values["routing_strategy"]),
+        warmup_iters=int(values["warmup_iters"]),
+        profile_iters=int(values["profile_iters"]),
+        profile=str(values["profile"]),
         profile_output_dir=(
-            str(data["profile_output_dir"])
-            if data.get("profile_output_dir") is not None
+            str(values["profile_output_dir"])
+            if values["profile_output_dir"] is not None
             else None
         ),
-        gpu_count=int(data.get("gpu_count", 8)),
-        random_seed=int(data.get("random_seed", 0)),
+        gpu_count=int(values["gpu_count"]),
+        random_seed=int(values["random_seed"]),
     )
     validate_config(config)
     return config
 
 
 def validate_config(config: BenchmarkConfig) -> None:
-    if config.phase not in _PHASES:
-        raise ValueError(f"phase must be one of {sorted(_PHASES)}")
+    if config.workload not in _WORKLOADS:
+        raise ValueError(f"workload must be one of {sorted(_WORKLOADS)}")
     if config.profile not in _PROFILES:
         raise ValueError(f"profile must be one of {sorted(_PROFILES)}")
     if config.execution_mode not in _EXECUTION_MODES:
@@ -244,12 +328,12 @@ def validate_config(config: BenchmarkConfig) -> None:
     for field_name in (
         "batch_size",
         "query_len",
-        "context_len",
         "hidden_size",
         "num_layers",
         "tensor_parallel_size",
         "data_parallel_size",
         "decode_context_parallel_size",
+        "kv_cache_memory_bytes",
         "gpu_count",
     ):
         if getattr(config, field_name) <= 0:
@@ -260,8 +344,18 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("profile_iters must be positive")
     if config.random_seed < 0:
         raise ValueError("random_seed must be non-negative")
-    if config.context_len < config.query_len:
-        raise ValueError("context_len must be greater than or equal to query_len")
+    if config.history_len < 0:
+        raise ValueError("history_len must be non-negative")
+    if config.workload == "full_prefill" and config.history_len != 0:
+        raise ValueError("full_prefill requires history_len=0")
+    if config.workload == "prefill_decode" and (
+        config.history_len <= 0 or config.query_len != 1
+    ):
+        raise ValueError("prefill_decode requires history_len>0 and query_len=1")
+    if config.workload == "extend_prefill" and config.history_len <= 0:
+        raise ValueError("extend_prefill requires history_len>0")
+    if config.batch_size % config.data_parallel_size != 0:
+        raise ValueError("batch_size must be divisible by data_parallel_size")
     if config.num_layers != 12:
         raise ValueError("Formal block profiling requires exactly 12 layers")
     if config.tensor_parallel_size % config.decode_context_parallel_size != 0:
@@ -271,6 +365,45 @@ def validate_config(config: BenchmarkConfig) -> None:
     if config.tensor_parallel_size * config.data_parallel_size != config.gpu_count:
         raise ValueError(
             "tensor_parallel_size * data_parallel_size must equal gpu_count"
+        )
+    if config.kda_prefill_backend not in _KDA_PREFILL_BACKENDS:
+        raise ValueError(
+            f"kda_prefill_backend must be one of {sorted(_KDA_PREFILL_BACKENDS)}"
+        )
+    if config.mla_prefill_backend not in _MLA_PREFILL_BACKENDS:
+        raise ValueError(
+            f"mla_prefill_backend must be one of {sorted(_MLA_PREFILL_BACKENDS)}"
+        )
+    if config.expert_placement_strategy not in _EXPERT_PLACEMENT_STRATEGIES:
+        raise ValueError(
+            "expert_placement_strategy must be one of "
+            f"{sorted(_EXPERT_PLACEMENT_STRATEGIES)}"
+        )
+    for field_name in (
+        "all2all_backend",
+        "attention_backend",
+        "kv_cache_dtype",
+        "linear_backend",
+        "moe_backend",
+        "routing_strategy",
+    ):
+        if not getattr(config, field_name):
+            raise ValueError(f"{field_name} must be non-empty")
+    if config.moe_backend == "deep_gemm_mega_moe":
+        if not config.enable_expert_parallel:
+            raise ValueError("deep_gemm_mega_moe requires expert parallel")
+        text_config = load_model_text_config(config.model)
+        if int(text_config["num_experts"]) % config.expert_parallel_size != 0:
+            raise ValueError("num_experts must be divisible by expert_parallel_size")
+    if config.shard_sp_shared_expert and not (
+        config.enable_expert_parallel
+        and config.tensor_parallel_size > 1
+        and (
+            config.data_parallel_size > 1 or config.moe_backend == "deep_gemm_mega_moe"
+        )
+    ):
+        raise ValueError(
+            "shard_sp_shared_expert requires sequence-parallel expert execution"
         )
 
     text_config = load_model_text_config(config.model)
@@ -313,6 +446,12 @@ def describe_layers(config: BenchmarkConfig) -> tuple[LayerDescription, ...]:
 def dry_run(data: dict[str, Any]) -> DryRunResult:
     config = parse_config(data)
     return DryRunResult(config=config, layers=describe_layers(config))
+
+
+def _require_bool(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
 
 
 def apply_overrides(data: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

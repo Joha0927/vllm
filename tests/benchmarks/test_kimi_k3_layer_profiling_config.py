@@ -20,6 +20,9 @@ from benchmarks.kimi_k3_layer_profiling.production_profile import (
 
 ROOT = Path(__file__).parents[2]
 SMOKE_CONFIG = ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml"
+PREFILL_DECODE_CONFIG = (
+    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/prefill_decode_bs8_p16384.yaml"
+)
 
 
 def _config():
@@ -45,12 +48,40 @@ def test_smoke_config_describes_the_first_real_block() -> None:
     ] == [0]
 
 
+def test_performance_path_defaults_are_explicit() -> None:
+    data = {
+        "workload": "full_prefill",
+        "batch_size": 1,
+        "history_len": 0,
+        "query_len": 128,
+    }
+
+    config = dry_run(data).config
+
+    assert config.moe_backend == "auto"
+    assert config.linear_backend == "auto"
+    assert config.attention_backend == "auto"
+    assert config.kda_prefill_backend == "auto"
+    assert config.mla_prefill_backend == "auto"
+    assert config.kv_cache_dtype == "auto"
+    assert config.kv_cache_memory_bytes == 4 * 1024**3
+    assert config.expert_placement_strategy == "linear"
+    assert config.enable_dbo is False
+    assert config.shard_sp_shared_expert is False
+    assert config.local_batch_size == 1
+
+
+def test_required_workload_fields_have_no_defaults() -> None:
+    with pytest.raises(ValueError, match="Missing required fields: history_len"):
+        dry_run({"workload": "full_prefill", "batch_size": 1, "query_len": 128})
+
+
 def test_cli_shape_overrides_do_not_mutate_yaml() -> None:
     data = load_yaml(SMOKE_CONFIG)
     result = dry_run(
         apply_overrides(
             data,
-            {"batch_size": 8, "query_len": 4096, "context_len": 4096},
+            {"batch_size": 8, "query_len": 4096},
         )
     )
 
@@ -65,10 +96,47 @@ def test_production_profile_uses_the_original_model_and_engine_core() -> None:
     assert kwargs["hf_overrides"] == {"text_config": {"num_hidden_layers": 12}}
     assert kwargs["enable_layerwise_nvtx_tracing"] is False
     assert kwargs["kv_cache_memory_bytes"] == 4 * 1024**3
+    assert kwargs["moe_backend"] == "auto"
+    assert kwargs["linear_backend"] == "auto"
+    assert kwargs["attention_backend"] is None
+    assert kwargs["kda_prefill_backend"] == "auto"
+    assert kwargs["kv_cache_dtype"] == "auto"
+    assert kwargs["expert_placement_strategy"] == "linear"
+    assert kwargs["enable_dbo"] is False
     assert kwargs["enforce_eager"] is True
+    assert kwargs["long_prefill_token_threshold"] == 0
+    assert kwargs["max_model_len"] == 129
+    assert kwargs["max_num_batched_tokens"] == 129
     assert "model_class_overrides" not in kwargs
     assert "enable_prompt_embeds" not in kwargs
     assert "profiler_config" not in kwargs
+
+
+def test_backend_overrides_reach_production_engine_args() -> None:
+    config = replace(
+        _config(),
+        attention_backend="flash_attn",
+        enable_dbo=True,
+        expert_placement_strategy="round_robin",
+        kda_prefill_backend="triton",
+        kv_cache_dtype="bfloat16",
+        kv_cache_memory_bytes=8 * 1024**3,
+        linear_backend="torch",
+        mla_prefill_backend="flash_attn",
+        moe_backend="deep_gemm_mega_moe",
+    )
+
+    kwargs = production_engine_args_kwargs(config)
+
+    assert kwargs["attention_backend"] == "flash_attn"
+    assert kwargs["attention_config"] == {"mla_prefill_backend": "flash_attn"}
+    assert kwargs["enable_dbo"] is True
+    assert kwargs["expert_placement_strategy"] == "round_robin"
+    assert kwargs["kda_prefill_backend"] == "triton"
+    assert kwargs["kv_cache_dtype"] == "bfloat16"
+    assert kwargs["kv_cache_memory_bytes"] == 8 * 1024**3
+    assert kwargs["linear_backend"] == "torch"
+    assert kwargs["moe_backend"] == "deep_gemm_mega_moe"
 
 
 def test_torch_profile_config_has_an_absolute_rank_output_dir(tmp_path: Path) -> None:
@@ -96,13 +164,66 @@ def test_production_evidence_excludes_custom_execution_paths() -> None:
     assert evidence["uses_custom_block_wrapper"] is False
     assert evidence["uses_manual_kv_cache_init"] is False
     assert evidence["model_class_override"] is False
+    assert evidence["requested_moe_backend"] == "auto"
+    assert evidence["requested_kda_prefill_backend"] == "auto"
+    assert evidence["local_batch_size"] == 1
+
+
+def test_prefill_decode_derives_one_decode_execution() -> None:
+    config = dry_run(load_yaml(PREFILL_DECODE_CONFIG)).config
+
+    assert config.workload == "prefill_decode"
+    assert config.prompt_len == 16384
+    assert config.query_len == 1
+    assert config.max_tokens == 2
+    assert config.max_model_len == 16386
+    assert config.prefill_tokens == 8 * 16384
+    assert config.num_scheduled_tokens == 8
+
+    kwargs = production_engine_args_kwargs(config)
+    assert kwargs["max_model_len"] == 16386
+    assert kwargs["max_num_batched_tokens"] == 16386
+    assert kwargs["max_num_seqs"] == 1
+    assert kwargs["tensor_parallel_size"] == 1
+    assert kwargs["data_parallel_size"] == 8
+    assert kwargs["distributed_executor_backend"] == "external_launcher"
+
+    evidence = production_profile_evidence(config)
+    assert evidence["workload"] == "prefill_decode"
+    assert evidence["max_tokens"] == 2
+
+
+def test_prefill_decode_rejects_multiple_profile_iterations() -> None:
+    config = dry_run(load_yaml(PREFILL_DECODE_CONFIG)).config
+
+    with pytest.raises(ValueError, match="prefill_decode requires profile_iters=1"):
+        validate_production_profile_config(replace(config, profile_iters=2))
+
+
+def test_prefill_decode_tp2_dp4_uses_two_local_requests() -> None:
+    data = load_yaml(PREFILL_DECODE_CONFIG)
+    config = dry_run(
+        apply_overrides(
+            data,
+            {"tensor_parallel_size": 2, "data_parallel_size": 4},
+        )
+    ).config
+
+    kwargs = production_engine_args_kwargs(config)
+    assert config.expert_parallel_size == 8
+    assert config.local_batch_size == 2
+    assert kwargs["max_num_seqs"] == 2
+    assert kwargs["max_num_batched_tokens"] == 2 * 16384
+    assert kwargs["distributed_executor_backend"] == "external_launcher"
 
 
 @pytest.mark.parametrize(
     ("config", "message"),
     [
-        (lambda c: replace(c, phase="decode"), "supports prefill only"),
-        (lambda c: replace(c, context_len=256), "context_len=query_len"),
+        (
+            lambda c: replace(c, workload="extend_prefill", history_len=64),
+            "extend_prefill production profiling is not implemented",
+        ),
         (lambda c: replace(c, execution_mode="cudagraph"), "execution_mode=eager"),
         (lambda c: replace(c, num_layers=8), "formal 12-layer block"),
         (
@@ -126,6 +247,50 @@ def test_cli_exposes_production_profile() -> None:
     assert args.production_profile
 
 
+def test_cli_exposes_performance_path_overrides() -> None:
+    args = parse_args(
+        [
+            "--config",
+            str(SMOKE_CONFIG),
+            "--dry-run",
+            "--moe-backend",
+            "deep_gemm_mega_moe",
+            "--linear-backend",
+            "torch",
+            "--kda-prefill-backend",
+            "flashkda",
+            "--mla-prefill-backend",
+            "flashinfer",
+            "--shard-sp-shared-expert",
+        ]
+    )
+
+    assert args.moe_backend == "deep_gemm_mega_moe"
+    assert args.linear_backend == "torch"
+    assert args.kda_prefill_backend == "flashkda"
+    assert args.mla_prefill_backend == "flashinfer"
+    assert args.shard_sp_shared_expert is True
+
+
+def test_cli_exposes_workload_overrides() -> None:
+    args = parse_args(
+        [
+            "--config",
+            str(SMOKE_CONFIG),
+            "--dry-run",
+            "--workload",
+            "prefill_decode",
+            "--history-len",
+            "16384",
+            "--query-len",
+            "1",
+        ]
+    )
+
+    assert args.workload == "prefill_decode"
+    assert args.history_len == 16384
+
+
 def test_cli_writes_deterministic_dry_run_manifest(tmp_path: Path) -> None:
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
@@ -141,11 +306,13 @@ def test_cli_writes_deterministic_dry_run_manifest(tmp_path: Path) -> None:
     [
         ("batch_size", 0, "batch_size must be positive"),
         ("query_len", -1, "query_len must be positive"),
-        ("context_len", 64, "context_len must be greater"),
-        ("num_layers", 8, "requires exactly 12 layers"),
+        ("history_len", -1, "history_len must be non-negative"),
         ("decode_context_parallel_size", 3, "must divide"),
         ("tensor_parallel_size", 4, "must equal gpu_count"),
         ("profile_iters", 0, "profile_iters must be positive"),
+        ("kv_cache_memory_bytes", 0, "kv_cache_memory_bytes must be positive"),
+        ("kda_prefill_backend", "invalid", "kda_prefill_backend must be one"),
+        ("mla_prefill_backend", "invalid", "mla_prefill_backend must be one"),
     ],
 )
 def test_invalid_config_fails_closed(field: str, value: object, message: str) -> None:
@@ -156,11 +323,58 @@ def test_invalid_config_fails_closed(field: str, value: object, message: str) ->
 
 
 @pytest.mark.parametrize(
-    "field", ["model", "hidden_size", "logical_start_layer", "num_experts"]
+    ("data", "message"),
+    [
+        (
+            {
+                "workload": "full_prefill",
+                "batch_size": 1,
+                "history_len": 1,
+                "query_len": 128,
+            },
+            "full_prefill requires history_len=0",
+        ),
+        (
+            {
+                "workload": "prefill_decode",
+                "batch_size": 1,
+                "history_len": 128,
+                "query_len": 2,
+            },
+            "prefill_decode requires history_len>0 and query_len=1",
+        ),
+    ],
+)
+def test_workload_shape_contracts_fail_closed(
+    data: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        dry_run(data)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["model", "hidden_size", "logical_start_layer", "num_experts", "num_layers"],
 )
 def test_model_structure_fields_cannot_be_overridden(field: str) -> None:
     data = load_yaml(SMOKE_CONFIG)
     data[field] = 1
 
     with pytest.raises(ValueError, match="Unsupported config fields"):
+        dry_run(data)
+
+
+def test_boolean_fields_reject_string_values() -> None:
+    data = load_yaml(SMOKE_CONFIG)
+    data["enable_dbo"] = "false"
+
+    with pytest.raises(ValueError, match="enable_dbo must be a boolean"):
+        dry_run(data)
+
+
+def test_shared_expert_sharding_requires_sequence_parallel_execution() -> None:
+    data = load_yaml(SMOKE_CONFIG)
+    data["shard_sp_shared_expert"] = True
+
+    with pytest.raises(ValueError, match="requires sequence-parallel"):
         dry_run(data)
