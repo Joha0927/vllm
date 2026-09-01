@@ -251,3 +251,188 @@ PyTorch Profiler 适合分析：
 当前结果使用 dummy MXFP4 weights 和 uniform-random routing，只代表真实 shape、
 production execution stack、H20 backend 与指定 routing simulation 下的性能，不代表
 真实 checkpoint 的生成质量或自然 expert 分布。
+
+## 10. 后续复用流程
+
+这套工具的日常使用原则是：模型结构和执行路径不变时，只调整 workload 参数，不修改
+Python 代码。
+
+### 10.1 选择测试规模
+
+测试规模由以下参数决定：
+
+```text
+batch_size          并发请求数
+query_len           每个请求的 prefill token 数
+context_len         当前仅支持 prefill，必须等于 query_len
+total_tokens        batch_size * query_len
+warmup_iters        正式采集前执行但不记录的次数
+profile_iters       正式记录的次数
+```
+
+模型的 `hidden_size`、专家数、attention 类型等结构参数从
+`model_config/config.json` 读取，不应随测试 workload 修改。正式 block profiling 固定加载
+并执行 `layers.0..11`。
+
+临时测试一个新 shape 时，可以直接使用命令行覆盖现有配置，无需新增 YAML。例如测试
+`BS=4, Q=2048`：
+
+```bash
+.venv/bin/python -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml \
+  --batch-size 4 \
+  --query-len 2048 \
+  --context-len 2048 \
+  --dry-run
+```
+
+需要长期保留或重复比较的 shape，应复制一份 YAML 并使用表达 workload 的文件名，例如：
+
+```text
+shapes/prefill_bs4_q2048.yaml
+```
+
+### 10.2 第一步：dry-run
+
+每个新 shape 首先执行 dry-run。它不需要 GPU，也不会加载权重：
+
+```bash
+.venv/bin/python -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml \
+  --batch-size 4 \
+  --query-len 2048 \
+  --context-len 2048 \
+  --dry-run
+```
+
+至少确认：
+
+```text
+num_scheduled_tokens = batch_size * query_len
+packed_shape = [num_scheduled_tokens, 7168]
+logical_layer_range = [0, 11]
+TP = 8, EP = 8, DCP = 1
+```
+
+### 10.3 第二步：production qualification
+
+在 H20 上先关闭 profiler，验证新 shape 能在真实 production 路径稳定运行：
+
+```bash
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+.venv/bin/python -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml \
+  --batch-size 4 \
+  --query-len 2048 \
+  --context-len 2048 \
+  --warmup-iters 1 \
+  --profile-iters 1 \
+  --production-profile \
+  --profile none
+```
+
+通过标准：
+
+- 最终输出 `stage=complete, status=PASS`；
+- 退出码为 0；
+- 调度参数能够容纳指定 batch 和总 token 数；
+- 无 OOM、CUDA、NCCL、worker 或 KV-cache failure；
+- 8 个 worker 正常退出，运行后 GPU 显存释放。
+
+qualification 失败时不要立即运行 profiler。先减小 `batch_size` 或 `query_len`，或者根据
+日志处理显存和调度问题。
+
+### 10.4 第三步：Torch Profiler 正式采集
+
+qualification 通过后，保持同一个 shape，增加 warmup 并开启 Torch Profiler。下面的
+`BS=4, Q=2048` 只是复用模板中的示例：
+
+```bash
+cd /home/l00948931/vllm
+
+RUN_COMMIT=$(git rev-parse HEAD)
+RUN_ID=$(date +%Y%m%d_%H%M%S)
+RUN_DIR="profile_outputs/prefill_bs4_q2048_torch/${RUN_ID}"
+TRACE_DIR="${RUN_DIR}/traces"
+
+mkdir -p "${TRACE_DIR}"
+
+printf \
+  'git_commit=%s\nrun_id=%s\nbatch_size=4\nquery_len=2048\ntotal_tokens=8192\nwarmup_iters=3\nprofile_iters=1\nprofiler=torch\n' \
+  "${RUN_COMMIT}" \
+  "${RUN_ID}" \
+  | tee "${RUN_DIR}/run_meta.txt"
+
+set -o pipefail
+
+HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+.venv/bin/python -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml \
+  --batch-size 4 \
+  --query-len 2048 \
+  --context-len 2048 \
+  --warmup-iters 3 \
+  --profile-iters 1 \
+  --production-profile \
+  --profile torch \
+  --profile-output-dir "${TRACE_DIR}" \
+  2>&1 | tee "${RUN_DIR}/torch_profile.log"
+
+PROFILE_RC=${PIPESTATUS[0]}
+printf 'profile_exit_code=%s\n' "${PROFILE_RC}" \
+  | tee -a "${RUN_DIR}/run_meta.txt"
+```
+
+每次测试必须使用新的 `RUN_ID`，避免覆盖旧 trace。结果目录不按 commit 分层；
+`run_meta.txt` 必须记录 Git commit、shape、warmup 次数和 profile 次数。
+
+### 10.5 第四步：验收和保存结果
+
+每轮正式采集检查：
+
+```bash
+find "${TRACE_DIR}" -type f -name '*.pt.trace.json.gz' -size +0c | sort
+find "${TRACE_DIR}" -type f -name '*.pt.trace.json.gz' -size +0c | wc -l
+
+grep -E '"stage": "complete".*"status": "PASS"' \
+  "${RUN_DIR}/torch_profile.log"
+
+grep -E -i -n \
+  'out of memory|CUDA error|NCCL error|worker.*failed|EngineCore failed|KV-cache failure' \
+  "${RUN_DIR}/torch_profile.log" \
+  || echo "no fatal error pattern"
+
+cat "${RUN_DIR}/run_meta.txt"
+```
+
+正式结果必须满足第 8 节的 trace 验收标准。至少保存：
+
+```text
+run_meta.txt
+torch_profile.log
+traces/*.pt.trace.json.gz
+```
+
+比较不同 shape 时，应保持模型 config、并行配置、routing strategy、warmup 次数、profile
+次数和软件 commit 一致，只改变计划比较的 workload 参数。
+
+### 10.6 什么时候需要修改代码
+
+以下情况不需要修改代码，只需改 YAML 或命令行参数：
+
+- 改 `batch_size`；
+- 改每请求 `query_len/context_len`；
+- 改 warmup 或 profile 次数；
+- 改输出目录或随机种子。
+
+只有以下需求才需要扩展实现：
+
+- 不再测试固定的 `layers.0..11`；
+- 改为 decode 或混合 prefill/decode workload；
+- 加载真实 checkpoint，而不是 dummy weights；
+- 改模型内部结构或支持其他模型；
+- 自动汇总 layer、kernel、通信时间或生成跨 rank 报表。
