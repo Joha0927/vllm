@@ -432,5 +432,6 @@ benchmarks/kimi_k3_layer_profiling/
 └── shapes/
     ├── smoke.yaml
     ├── prefill_bs8_q4096.yaml
-    └── prefill_decode_bs8_p16384.yaml
+    ├── prefill_decode_bs8_p16384.yaml
+    └── prefill_decode_bs8_p16384_tp2_dp4.yaml
 ```

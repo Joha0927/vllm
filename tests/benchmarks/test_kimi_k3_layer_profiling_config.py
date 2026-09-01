@@ -25,6 +25,10 @@ SMOKE_CONFIG = ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml"
 PREFILL_DECODE_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/prefill_decode_bs8_p16384.yaml"
 )
+PREFILL_DECODE_TP2_DP4_CONFIG = (
+    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+    "prefill_decode_bs8_p16384_tp2_dp4.yaml"
+)
 
 
 def _config():
@@ -203,13 +207,7 @@ def test_prefill_decode_rejects_multiple_profile_iterations() -> None:
 
 
 def test_prefill_decode_tp2_dp4_uses_two_local_requests() -> None:
-    data = load_yaml(PREFILL_DECODE_CONFIG)
-    config = dry_run(
-        apply_overrides(
-            data,
-            {"tensor_parallel_size": 2, "data_parallel_size": 4},
-        )
-    ).config
+    config = dry_run(load_yaml(PREFILL_DECODE_TP2_DP4_CONFIG)).config
 
     kwargs = production_engine_args_kwargs(config)
     assert config.expert_parallel_size == 8
