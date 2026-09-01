@@ -127,6 +127,30 @@ def production_profile_evidence(config: BenchmarkConfig) -> dict[str, Any]:
     }
 
 
+def _validate_output_token_counts(
+    outputs: list[Any], expected_requests: int, expected_tokens: int
+) -> list[int]:
+    if len(outputs) != expected_requests:
+        raise RuntimeError(
+            f"expected {expected_requests} request outputs, got {len(outputs)}"
+        )
+    token_counts: list[int] = []
+    for request_index, output in enumerate(outputs):
+        if len(output.outputs) != 1:
+            raise RuntimeError(
+                f"request {request_index} produced {len(output.outputs)} sequences, "
+                "expected 1"
+            )
+        token_count = len(output.outputs[0].token_ids)
+        if token_count != expected_tokens:
+            raise RuntimeError(
+                f"request {request_index} produced {token_count} output tokens, "
+                f"expected {expected_tokens}"
+            )
+        token_counts.append(token_count)
+    return token_counts
+
+
 def run_production_profile(config: BenchmarkConfig) -> None:
     validate_production_profile_config(config)
     if config.data_parallel_size > 1:
@@ -216,8 +240,13 @@ def run_production_profile(config: BenchmarkConfig) -> None:
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
 
-    def generate_once() -> None:
-        llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+    def generate_once() -> list[int]:
+        outputs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+        return _validate_output_token_counts(
+            outputs,
+            expected_requests=config.local_batch_size,
+            expected_tokens=config.max_tokens,
+        )
 
     for _ in range(config.warmup_iters):
         generate_once()
@@ -226,16 +255,23 @@ def run_production_profile(config: BenchmarkConfig) -> None:
     if config.profile == "torch":
         llm.start_profile("kimi_k3_first_block")
         barrier()
+    profiled_output_token_counts: list[list[int]] = []
     try:
         for _ in range(config.profile_iters):
-            generate_once()
+            profiled_output_token_counts.append(generate_once())
     finally:
         if config.profile == "torch":
             llm.stop_profile()
 
     print(
         json.dumps(
-            {**rank_evidence, "stage": "complete", "status": "PASS"},
+            {
+                **rank_evidence,
+                "decode_executions_per_request": config.max_tokens - 1,
+                "profiled_output_token_counts": profiled_output_token_counts,
+                "stage": "complete",
+                "status": "PASS",
+            },
             sort_keys=True,
         )
     )

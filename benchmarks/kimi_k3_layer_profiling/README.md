@@ -374,6 +374,8 @@ Extend-prefill streaming barrier 以及 worker 侧 resolved-backend evidence 尚
 
 - prompt 每请求恰好 16384 tokens；
 - 每个请求生成 2 个 output tokens；
+- 每个 complete record 的 `profiled_output_token_counts` 全部为 2；
+- `decode_executions_per_request=1`；
 - 每个 layer scope 在每份 trace 中恰好出现两次；
 - 第一次是 full prefill，第二次是单-token decode；
 - 两次执行可通过顺序、token 数和 recorded shapes 区分。

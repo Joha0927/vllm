@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from benchmarks.kimi_k3_layer_profiling.config import (
     load_yaml,
 )
 from benchmarks.kimi_k3_layer_profiling.production_profile import (
+    _validate_output_token_counts,
     production_engine_args_kwargs,
     production_profile_evidence,
     validate_production_profile_config,
@@ -215,6 +217,18 @@ def test_prefill_decode_tp2_dp4_uses_two_local_requests() -> None:
     assert kwargs["max_num_seqs"] == 2
     assert kwargs["max_num_batched_tokens"] == 2 * 16384
     assert kwargs["distributed_executor_backend"] == "external_launcher"
+
+
+def test_output_token_evidence_requires_exactly_two_tokens() -> None:
+    outputs = [
+        SimpleNamespace(outputs=[SimpleNamespace(token_ids=[11, 12])]),
+        SimpleNamespace(outputs=[SimpleNamespace(token_ids=[21, 22])]),
+    ]
+
+    assert _validate_output_token_counts(outputs, 2, 2) == [2, 2]
+
+    with pytest.raises(RuntimeError, match="produced 2 output tokens, expected 1"):
+        _validate_output_token_counts(outputs, 2, 1)
 
 
 @pytest.mark.parametrize(
