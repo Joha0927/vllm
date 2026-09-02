@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-out", type=Path)
     parser.add_argument(
         "--workload",
-        choices=("full_prefill", "extend_prefill", "prefill_decode"),
+        choices=("full_prefill", "prefill_decode"),
     )
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--history-len", type=int)

@@ -13,8 +13,6 @@ from benchmarks.kimi_k3_layer_profiling.config import (
 
 
 def validate_production_profile_config(config: BenchmarkConfig) -> None:
-    if config.workload == "extend_prefill":
-        raise ValueError("extend_prefill production profiling is not implemented")
     if config.workload not in {"full_prefill", "prefill_decode"}:
         raise ValueError("unsupported production workload")
     if config.execution_mode != "eager":
@@ -105,7 +103,6 @@ def production_profile_evidence(config: BenchmarkConfig) -> dict[str, Any]:
         "local_batch_size": config.local_batch_size,
         "max_model_len": config.max_model_len,
         "max_tokens": config.max_tokens,
-        "model_class_override": False,
         "num_layers": config.num_layers,
         "requested_kv_cache_memory_bytes": config.kv_cache_memory_bytes,
         "requested_kda_prefill_backend": config.kda_prefill_backend,
@@ -119,8 +116,6 @@ def production_profile_evidence(config: BenchmarkConfig) -> dict[str, Any]:
         "profile": config.profile,
         "profile_output_dir": config.profile_output_dir,
         "query_len": config.query_len,
-        "uses_custom_block_wrapper": False,
-        "uses_manual_kv_cache_init": False,
         "warmup_iters": config.warmup_iters,
         "workload": config.workload,
         "profile_iters": config.profile_iters,

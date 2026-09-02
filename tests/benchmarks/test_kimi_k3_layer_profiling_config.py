@@ -162,14 +162,11 @@ def test_torch_profile_config_has_an_absolute_rank_output_dir(tmp_path: Path) ->
     assert profiler_config.torch_profiler_with_stack is False
 
 
-def test_production_evidence_excludes_custom_execution_paths() -> None:
+def test_production_evidence_records_current_execution_path() -> None:
     evidence = production_profile_evidence(_config())
 
     assert evidence["execution_path"] == "LLM/EngineCore/production_model"
     assert evidence["expected_layer_range"] == [0, 11]
-    assert evidence["uses_custom_block_wrapper"] is False
-    assert evidence["uses_manual_kv_cache_init"] is False
-    assert evidence["model_class_override"] is False
     assert evidence["requested_moe_backend"] == "auto"
     assert evidence["requested_kda_prefill_backend"] == "auto"
     assert evidence["local_batch_size"] == 1
@@ -232,10 +229,6 @@ def test_output_token_evidence_requires_exactly_two_tokens() -> None:
 @pytest.mark.parametrize(
     ("config", "message"),
     [
-        (
-            lambda c: replace(c, workload="extend_prefill", history_len=64),
-            "extend_prefill production profiling is not implemented",
-        ),
         (lambda c: replace(c, execution_mode="cudagraph"), "execution_mode=eager"),
         (lambda c: replace(c, num_layers=8), "formal 12-layer block"),
         (

@@ -21,6 +21,26 @@ LLM / AsyncLLM
 截断为 12。测试不使用自定义模型类、block wrapper、手工 attention metadata 或手工
 KV-cache 初始化。
 
+### 与直接修改层数并启动 `vllm serve` 的区别
+
+两种方式可以使用相同的 production `EngineCore`、模型、KV cache、attention/MoE
+backend 和通信实现；当前 benchmark 不是简化版 block forward。区别主要在实验控制：
+
+| 当前 benchmark | 直接 `vllm serve` |
+| --- | --- |
+| 直接输入固定随机种子的 token IDs | 通常输入文本并经过 tokenizer |
+| 固定 global/local batch 和 request-to-DP 映射 | continuous batching 和负载均衡可能改变请求组合 |
+| 根据 workload 固定 `max_num_seqs`、token budget 和 `max_model_len` | 默认 scheduler 参数可能拆分或重组 prefill |
+| 固定 warmup，并用 barrier 对齐所有 worker 的 profiler 起点 | 需要客户端自行协调 warmup、请求完成和 profile API |
+| 验证每个请求实际生成 2 个 token，证明 decode 已执行 | 仅设置 `max_tokens=2` 不能代替结果验收 |
+| 输出拓扑、请求映射、shape、backend 和 rank evidence | 需要额外客户端和日志处理才能获得同等证据 |
+
+因此，`vllm serve` 更适合端到端在线服务延迟、排队、tokenizer 和 continuous batching
+测试；当前 benchmark 更适合固定 shape、固定并行策略、可重复比较的 12-layer block
+profiling。如果为 `vllm serve` 补齐固定 token IDs、请求屏障、scheduler 参数、warmup、
+profile start/stop 和结果验收，两者的 worker-side trace 可以接近，但这相当于重新实现一套
+profiling client。
+
 ## 2. 固定条件
 
 以下内容属于模型或正式实验基线：
@@ -58,52 +78,19 @@ IDs，相同配置可复现输入。
 EP = TP * DP
 ```
 
-正式采集共四组：
+正式采集共两组：
 
-| Workload | TP | DP | EP | 全局 BS | 前置阶段/request | 目标阶段/request |
+| Workload | TP | DP | EP | 全局 BS | Prefill/request | Decode/request |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Extend prefill | 1 | 8 | 8 | 8 | history 14336 | prefill 2048 |
-| Extend prefill | 2 | 4 | 8 | 8 | history 14336 | prefill 2048 |
-| Prefill + decode | 1 | 8 | 8 | 8 | prefill 16384 | decode 1 |
-| Prefill + decode | 2 | 4 | 8 | 8 | prefill 16384 | decode 1 |
+| Prefill + decode | 1 | 8 | 8 | 8 | 16384 | 1 |
+| Prefill + decode | 2 | 4 | 8 | 8 | 16384 | 1 |
 
 TP1/DP8 时每个 DP rank 处理 1 个请求；TP2/DP4 时每个 DP rank 处理 2 个请求。
 runner 必须显式分配并记录 request-to-DP 映射，不能只根据全局 batch 推测本地 batch。
 
 ## 4. Workload 定义
 
-### 4.1 Extend prefill
-
-每个请求先执行 14336 tokens history，再执行 2048 tokens target prefill：
-
-```text
-history/request       = 14336
-query/request         = 2048
-final context/request = 16384
-target tokens/global  = 8 * 2048 = 16384
-```
-
-使用 production `AsyncLLM` streaming-input session：
-
-```text
-提交 14336-token streaming chunk
-  -> 8 个 session 全部完成 history 并暂停
-  -> 启动 Torch Profiler
-  -> 向同一批 session 追加 2048-token chunk
-  -> 停止 Torch Profiler
-```
-
-两段输入属于同一个 EngineCore request/session。第一段建立真实 KDA recurrent state 和
-MLA KV cache，trace 只记录第二段。8 个 stream 使用 barrier 同步，防止某个 DP rank 的
-history 与其他 rank 的目标阶段重叠。
-
-每个 streaming chunk 使用 `max_tokens=1` 和 `ignore_eos=true`。第一段完成后会基于
-history 采样一个 token，但该 token 尚未经过下一次 model execution；production
-streaming update 在追加第二段时必须丢弃这个末尾 sampled token。验收 evidence 必须
-证明追加 target chunk 前的 `num_computed_tokens=14336`，且没有 generated token 被并入
-history；不能只根据输入生成器已 yield 就认定 history 已经完成。
-
-### 4.2 Prefill + decode
+### 4.1 Prefill + decode
 
 每个请求输入 16384 tokens，并生成 2 个 output tokens：
 
@@ -156,7 +143,7 @@ prompt tokens。
 ### 5.1 Workload
 
 ```text
-workload            full_prefill、extend_prefill 或 prefill_decode
+workload            full_prefill 或 prefill_decode
 batch_size          全局请求数
 history_len         目标阶段前每请求已经处理的 token 数
 query_len           目标阶段每请求执行的 token 数
@@ -166,7 +153,6 @@ random_seed         token IDs 随机种子
 正式配置为：
 
 ```text
-Extend prefill: workload=extend_prefill, history_len=14336, query_len=2048
 Prefill+decode: workload=prefill_decode, history_len=16384, query_len=1
 ```
 
@@ -314,7 +300,6 @@ TP1/DP8 和 TP2/DP4 使用 production external-launcher，必须通过单机 8-r
 处理相同请求。`max_num_seqs` 和 `max_num_batched_tokens` 按每个 DP engine 的本地
 workload 推导。
 
-Extend prefill 必须使用 production streaming session 保持精确的 14336-token history。
 Prefill + decode 必须使用 `max_tokens=2`。这些调度参数由 workload 推导，不作为用户任意
 覆盖项。
 
@@ -334,17 +319,14 @@ max_num_batched_tokens >= 每个 DP engine 在该 step 的本地 prompt token �
 ## 7. 实现状态和下一步
 
 当前 production EngineCore、12-layer model loading、Torch Profiler worker traces、
-`layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现。
-Extend-prefill streaming barrier 以及 worker 侧 resolved-backend evidence 尚未实现。
+`layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现并通过
+TP1/DP8/EP8 qualification。TP2/DP4 使用同一条执行路径和独立配置。
 
 实现顺序：
 
-1. 在 worker evidence 中补齐 resolved backend 和实际 expert/attention 类；
-2. 对 Prefill+decode 分别完成 TP1/DP8 和 TP2/DP4 qualification；
-3. 实现 Extend-prefill streaming barrier；
-4. 对 Extend-prefill 分别完成两种并行策略 qualification；
-5. 执行四组正式 Torch Profiler 采集；
-6. 汇总 layer、kernel、All-to-All/NCCL、rank-max latency 和峰值显存。
+1. 对目标并行配置先执行 qualification；
+2. 使用完全相同的配置执行正式 Torch Profiler 采集；
+3. 汇总 layer、kernel、All-to-All/NCCL、rank-max latency 和峰值显存。
 
 ## 8. 验收标准
 
@@ -361,16 +343,7 @@ Extend-prefill streaming barrier 以及 worker 侧 resolved-backend evidence 尚
 - trace 不包含 `layers.12` 或更高 decoder layer；
 - 运行后 GPU 显存释放。
 
-### 8.2 Extend prefill
-
-- 8 个 session 的 14336-token history 均已完成；
-- target chunk 释放前，每个 session 的 `num_computed_tokens=14336`；
-- history 阶段采样但未计算的末尾 token 已被 streaming update 丢弃；
-- history forward 不出现在 trace；
-- target iteration 每请求恰好执行 2048 tokens；
-- 每个 layer scope 在每份 trace 中恰好出现一次。
-
-### 8.3 Prefill + decode
+### 8.2 Prefill + decode
 
 - prompt 每请求恰好 16384 tokens；
 - 每个请求生成 2 个 output tokens；
@@ -423,6 +396,7 @@ exit code
 ```text
 benchmarks/kimi_k3_layer_profiling/
 ├── README.md
+├── EXTEND_PREFILL_PLAN.md
 ├── __init__.py
 ├── benchmark.py
 ├── config.py
@@ -431,7 +405,6 @@ benchmarks/kimi_k3_layer_profiling/
 │   └── config.json
 └── shapes/
     ├── smoke.yaml
-    ├── prefill_bs8_q4096.yaml
     ├── prefill_decode_bs8_p16384.yaml
     └── prefill_decode_bs8_p16384_tp2_dp4.yaml
 ```

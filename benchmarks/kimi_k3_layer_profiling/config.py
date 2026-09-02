@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-_WORKLOADS = {"extend_prefill", "full_prefill", "prefill_decode"}
+_WORKLOADS = {"full_prefill", "prefill_decode"}
 _PROFILES = {"none", "torch"}
 _EXECUTION_MODES = {"eager", "cudagraph"}
 _MODEL_CONFIG_DIR = "benchmarks/kimi_k3_layer_profiling/model_config"
@@ -206,8 +206,6 @@ class DryRunResult:
             "history_len": config.history_len,
             "max_model_len": config.max_model_len,
             "max_tokens": config.max_tokens,
-            "physical_layer_index": config.logical_start_layer,
-            "physical_start_layer": config.logical_start_layer,
             "profile": config.profile,
             "profile_output_dir": config.profile_output_dir,
             "profile_iters": config.profile_iters,
@@ -352,8 +350,6 @@ def validate_config(config: BenchmarkConfig) -> None:
         config.history_len <= 0 or config.query_len != 1
     ):
         raise ValueError("prefill_decode requires history_len>0 and query_len=1")
-    if config.workload == "extend_prefill" and config.history_len <= 0:
-        raise ValueError("extend_prefill requires history_len>0")
     if config.batch_size % config.data_parallel_size != 0:
         raise ValueError("batch_size must be divisible by data_parallel_size")
     if config.num_layers != 12:
