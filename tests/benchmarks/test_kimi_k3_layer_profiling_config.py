@@ -33,6 +33,18 @@ PREFILL_DECODE_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_with_stack.yaml"
 )
+PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG = (
+    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+    "prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml"
+)
+PREFILL_DECODE_DEEPEP_HT_CONFIG = (
+    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+    "prefill_decode_bs8_p16384_deepep_ht.yaml"
+)
+PREFILL_DECODE_DEEPEP_HT_WITH_STACK_CONFIG = (
+    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+    "prefill_decode_bs8_p16384_deepep_ht_with_stack.yaml"
+)
 
 
 def _config():
@@ -184,6 +196,48 @@ def test_torch_profile_with_stack_reaches_profiler_config(tmp_path: Path) -> Non
         ]
         is True
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "tp", "dp", "all2all_backend", "with_stack"),
+    [
+        (PREFILL_DECODE_CONFIG, 1, 8, "allgather_reducescatter", False),
+        (PREFILL_DECODE_WITH_STACK_CONFIG, 1, 8, "allgather_reducescatter", True),
+        (PREFILL_DECODE_TP2_DP4_CONFIG, 2, 4, "allgather_reducescatter", False),
+        (
+            PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG,
+            2,
+            4,
+            "allgather_reducescatter",
+            True,
+        ),
+        (PREFILL_DECODE_DEEPEP_HT_CONFIG, 1, 8, "deepep_high_throughput", False),
+        (
+            PREFILL_DECODE_DEEPEP_HT_WITH_STACK_CONFIG,
+            1,
+            8,
+            "deepep_high_throughput",
+            True,
+        ),
+    ],
+)
+def test_formal_matrix_configs(
+    path: Path,
+    tp: int,
+    dp: int,
+    all2all_backend: str,
+    with_stack: bool,
+) -> None:
+    config = dry_run(load_yaml(path)).config
+
+    assert config.batch_size == 8
+    assert config.prompt_len == 16384
+    assert config.max_tokens == 2
+    assert config.tensor_parallel_size == tp
+    assert config.data_parallel_size == dp
+    assert config.expert_parallel_size == 8
+    assert config.all2all_backend == all2all_backend
+    assert config.profiler_with_stack is with_stack
 
 
 def test_production_evidence_records_current_execution_path() -> None:

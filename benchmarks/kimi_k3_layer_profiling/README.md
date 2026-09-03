@@ -65,11 +65,12 @@ IDs，相同配置可复现输入。
 
 ## 3. 正式测试矩阵
 
-使用全局 batch 8、EP8、DCP1，对比两种并行策略：
+使用全局 batch 8、EP8、DCP1，对比三种执行组合：
 
 ```text
-策略 A: TP1 / DP8 / EP8 / DCP1
-策略 B: TP2 / DP4 / EP8 / DCP1
+策略 A: TP1 / DP8 / EP8 / DCP1 / AG+RS
+策略 B: TP2 / DP4 / EP8 / DCP1 / AG+RS
+策略 C: TP1 / DP8 / EP8 / DCP1 / DeepEP HT
 ```
 
 启用 expert parallel 后，当前配置没有 PCP，因此：
@@ -78,12 +79,19 @@ IDs，相同配置可复现输入。
 EP = TP * DP
 ```
 
-正式采集共两组：
+每种执行组合分别采集 no-stack 性能 trace 和 with-stack 归因 trace，共六组：
 
-| Workload | TP | DP | EP | 全局 BS | Prefill/request | Decode/request |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Prefill + decode | 1 | 8 | 8 | 8 | 16384 | 1 |
-| Prefill + decode | 2 | 4 | 8 | 8 | 16384 | 1 |
+| 组 | All-to-All | TP | DP | EP | with-stack | 用途 |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| A0 | AG+RS | 1 | 8 | 8 | false | 性能基线 |
+| A1 | AG+RS | 1 | 8 | 8 | true | 源码归因 |
+| B0 | AG+RS | 2 | 4 | 8 | false | 性能基线 |
+| B1 | AG+RS | 2 | 4 | 8 | true | 源码归因 |
+| C0 | DeepEP HT | 1 | 8 | 8 | false | All-to-All 性能对照 |
+| C1 | DeepEP HT | 1 | 8 | 8 | true | DeepEP 源码归因 |
+
+六组 workload 均为每请求 16384-token prefill 加一次 single-token decode，全局 BS 为 8。
+性能结论只比较 A0/B0/C0；A1/B1/C1 用于解释 kernel 来源，不参与 latency 基线。
 
 TP1/DP8 时每个 DP rank 处理 1 个请求；TP2/DP4 时每个 DP rank 处理 2 个请求。
 runner 必须显式分配并记录 request-to-DP 映射，不能只根据全局 batch 推测本地 batch。
@@ -188,8 +196,9 @@ EP enabled 时，EP = TP * DP
 ```
 
 `all2all_backend` 决定 MoE token dispatch/combine 的通信实现，必须作为输入配置。当前已
-验证的基线是 `allgather_reducescatter`。其他 backend 必须分别 qualification，不能因为
-名称存在就认为 H20 环境可用。
+验证的基线是 `allgather_reducescatter`。新增对照为
+`deepep_high_throughput`，正式采集前必须独立完成环境检查和 qualification；不能因为名称
+存在或 import 成功就认为 H20 runtime 可用。
 
 `expert_placement_strategy` 决定 global experts 到 EP rank 的映射，基线为 `linear`。
 `enable_dbo` 控制 dual-batch overlap，基线为 `false`；开启后还必须记录 ubatch 和
@@ -325,14 +334,16 @@ max_num_batched_tokens >= 每个 DP engine 在该 step 的本地 prompt token �
 ## 7. 实现状态和下一步
 
 当前 production EngineCore、12-layer model loading、Torch Profiler worker traces、
-`layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现并通过
-TP1/DP8/EP8 qualification。TP2/DP4 使用同一条执行路径和独立配置。
+`layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现。
+AG+RS 的 TP1/DP8 和 TP2/DP4 已有独立配置；DeepEP HT 使用 TP1/DP8，并在进入正式采集
+前单独 qualification。
 
 实现顺序：
 
-1. 对目标并行配置先执行 qualification；
-2. 使用完全相同的配置执行正式 Torch Profiler 采集；
-3. 汇总 layer、kernel、All-to-All/NCCL、rank-max latency 和峰值显存。
+1. 对目标并行和 All-to-All 配置先执行 qualification；
+2. 为每种组合分别采集 no-stack 和 with-stack trace；
+3. 只使用 no-stack trace 比较性能；
+4. 汇总 layer、kernel、All-to-All/NCCL、rank-max latency 和峰值显存。
 
 ## 8. 验收标准
 
@@ -412,6 +423,9 @@ benchmarks/kimi_k3_layer_profiling/
 └── shapes/
     ├── smoke.yaml
     ├── prefill_decode_bs8_p16384.yaml
+    ├── prefill_decode_bs8_p16384_with_stack.yaml
     ├── prefill_decode_bs8_p16384_tp2_dp4.yaml
-    └── prefill_decode_bs8_p16384_with_stack.yaml
+    ├── prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml
+    ├── prefill_decode_bs8_p16384_deepep_ht.yaml
+    └── prefill_decode_bs8_p16384_deepep_ht_with_stack.yaml
 ```
