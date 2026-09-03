@@ -9,7 +9,7 @@ tensor_parallel_size: 2
 data_parallel_size: 4
 decode_context_parallel_size: 1
 enable_expert_parallel: true
-all2all_backend: allgather_reducescatter
+all2all_backend: flashinfer_nvlink_two_sided
 expert_placement_strategy: linear
 enable_dbo: false
 moe_backend: auto
@@ -25,6 +25,7 @@ routing_strategy: uniform_random
 warmup_iters: 3
 profile_iters: 1
 profile: none
-profiler_with_stack: false
+# All formal traces include Python call stacks for source attribution.
+profiler_with_stack: true
 gpu_count: 8
 random_seed: 0

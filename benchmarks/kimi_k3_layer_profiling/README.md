@@ -70,7 +70,7 @@ IDs，相同配置可复现输入。
 ```text
 策略 A: TP1 / DP8 / EP8 / DCP1 / AG+RS
 策略 B: TP2 / DP4 / EP8 / DCP1 / AG+RS
-策略 C: TP1 / DP8 / EP8 / DCP1 / DeepEP HT
+策略 D: TP2 / DP4 / EP8 / DCP1 / FlashInfer NVLink two-sided A2A
 ```
 
 启用 expert parallel 后，当前配置没有 PCP，因此：
@@ -79,19 +79,17 @@ IDs，相同配置可复现输入。
 EP = TP * DP
 ```
 
-每种执行组合分别采集 no-stack 性能 trace 和 with-stack 归因 trace，共六组：
+三种执行组合均采集 with-stack trace：
 
 | 组 | All-to-All | TP | DP | EP | with-stack | 用途 |
 | --- | --- | ---: | ---: | ---: | --- | --- |
-| A0 | AG+RS | 1 | 8 | 8 | false | 性能基线 |
-| A1 | AG+RS | 1 | 8 | 8 | true | 源码归因 |
-| B0 | AG+RS | 2 | 4 | 8 | false | 性能基线 |
-| B1 | AG+RS | 2 | 4 | 8 | true | 源码归因 |
-| C0 | DeepEP HT | 1 | 8 | 8 | false | All-to-All 性能对照 |
-| C1 | DeepEP HT | 1 | 8 | 8 | true | DeepEP 源码归因 |
+| A | AG+RS | 1 | 8 | 8 | true | TP1 AG+RS 基线与源码归因 |
+| B | AG+RS | 2 | 4 | 8 | true | TP2 AG+RS 基线与源码归因 |
+| D | FlashInfer A2A | 2 | 4 | 8 | true | TP2 All-to-All 对照与源码归因 |
 
-六组 workload 均为每请求 16384-token prefill 加一次 single-token decode，全局 BS 为 8。
-性能结论只比较 A0/B0/C0；A1/B1/C1 用于解释 kernel 来源，不参与 latency 基线。
+三组 workload 均为每请求 16384-token prefill 加一次 single-token decode，全局 BS 为 8。
+所有组使用相同的 profiler 设置，因此只在这三组 trace 之间进行相对性能比较；with-stack
+开销意味着 trace latency 不能直接视为无 profiler 时的线上绝对 latency。
 
 TP1/DP8 时每个 DP rank 处理 1 个请求；TP2/DP4 时每个 DP rank 处理 2 个请求。
 runner 必须显式分配并记录 request-to-DP 映射，不能只根据全局 batch 推测本地 batch。
@@ -197,8 +195,10 @@ EP enabled 时，EP = TP * DP
 
 `all2all_backend` 决定 MoE token dispatch/combine 的通信实现，必须作为输入配置。当前已
 验证的基线是 `allgather_reducescatter`。新增对照为
-`deepep_high_throughput`，正式采集前必须独立完成环境检查和 qualification；不能因为名称
-存在或 import 成功就认为 H20 runtime 可用。
+`flashinfer_nvlink_two_sided`，它使用 FlashInfer/TRT-LLM NVLink two-sided All-to-All，
+而不是 DeepEP。正式采集前必须独立 qualification，确认 FlashInfer comm 模块实际可用，
+且 runtime manager 已解析为目标实现。`naive` 和已删除的 `pplx` 不可作为真正 All-to-All
+对照，因为当前 vLLM 会将它们回退为 `allgather_reducescatter`。
 
 `expert_placement_strategy` 决定 global experts 到 EP rank 的映射，基线为 `linear`。
 `enable_dbo` 控制 dual-batch overlap，基线为 `false`；开启后还必须记录 ubatch 和
@@ -335,14 +335,14 @@ max_num_batched_tokens >= 每个 DP engine 在该 step 的本地 prompt token �
 
 当前 production EngineCore、12-layer model loading、Torch Profiler worker traces、
 `layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现。
-AG+RS 的 TP1/DP8 和 TP2/DP4 已有独立配置；DeepEP HT 使用 TP1/DP8，并在进入正式采集
-前单独 qualification。
+正式矩阵包含 AG+RS 的 TP1/DP8 与 TP2/DP4，以及 FlashInfer two-sided A2A 的
+TP2/DP4；每组在正式采集前单独 qualification。
 
 实现顺序：
 
 1. 对目标并行和 All-to-All 配置先执行 qualification；
-2. 为每种组合分别采集 no-stack 和 with-stack trace；
-3. 只使用 no-stack trace 比较性能；
+2. 为每种组合采集 `profiler_with_stack=true` 的 trace；
+3. 仅在使用相同 profiler 设置的三组之间做相对比较；
 4. 汇总 layer、kernel、All-to-All/NCCL、rank-max latency 和峰值显存。
 
 ## 8. 验收标准
@@ -422,10 +422,7 @@ benchmarks/kimi_k3_layer_profiling/
 │   └── config.json
 └── shapes/
     ├── smoke.yaml
-    ├── prefill_decode_bs8_p16384.yaml
     ├── prefill_decode_bs8_p16384_with_stack.yaml
-    ├── prefill_decode_bs8_p16384_tp2_dp4.yaml
     ├── prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml
-    ├── prefill_decode_bs8_p16384_deepep_ht.yaml
-    └── prefill_decode_bs8_p16384_deepep_ht_with_stack.yaml
+    └── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_a2a_with_stack.yaml
 ```

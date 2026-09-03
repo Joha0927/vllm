@@ -22,13 +22,6 @@ from benchmarks.kimi_k3_layer_profiling.production_profile import (
 
 ROOT = Path(__file__).parents[2]
 SMOKE_CONFIG = ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml"
-PREFILL_DECODE_CONFIG = (
-    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/prefill_decode_bs8_p16384.yaml"
-)
-PREFILL_DECODE_TP2_DP4_CONFIG = (
-    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
-    "prefill_decode_bs8_p16384_tp2_dp4.yaml"
-)
 PREFILL_DECODE_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_with_stack.yaml"
@@ -37,13 +30,9 @@ PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml"
 )
-PREFILL_DECODE_DEEPEP_HT_CONFIG = (
+PREFILL_DECODE_TP2_DP4_FLASHINFER_A2A_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
-    "prefill_decode_bs8_p16384_deepep_ht.yaml"
-)
-PREFILL_DECODE_DEEPEP_HT_WITH_STACK_CONFIG = (
-    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
-    "prefill_decode_bs8_p16384_deepep_ht_with_stack.yaml"
+    "prefill_decode_bs8_p16384_tp2_dp4_flashinfer_a2a_with_stack.yaml"
 )
 
 
@@ -201,9 +190,7 @@ def test_torch_profile_with_stack_reaches_profiler_config(tmp_path: Path) -> Non
 @pytest.mark.parametrize(
     ("path", "tp", "dp", "all2all_backend", "with_stack"),
     [
-        (PREFILL_DECODE_CONFIG, 1, 8, "allgather_reducescatter", False),
         (PREFILL_DECODE_WITH_STACK_CONFIG, 1, 8, "allgather_reducescatter", True),
-        (PREFILL_DECODE_TP2_DP4_CONFIG, 2, 4, "allgather_reducescatter", False),
         (
             PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG,
             2,
@@ -211,12 +198,11 @@ def test_torch_profile_with_stack_reaches_profiler_config(tmp_path: Path) -> Non
             "allgather_reducescatter",
             True,
         ),
-        (PREFILL_DECODE_DEEPEP_HT_CONFIG, 1, 8, "deepep_high_throughput", False),
         (
-            PREFILL_DECODE_DEEPEP_HT_WITH_STACK_CONFIG,
-            1,
-            8,
-            "deepep_high_throughput",
+            PREFILL_DECODE_TP2_DP4_FLASHINFER_A2A_WITH_STACK_CONFIG,
+            2,
+            4,
+            "flashinfer_nvlink_two_sided",
             True,
         ),
     ],
@@ -251,7 +237,7 @@ def test_production_evidence_records_current_execution_path() -> None:
 
 
 def test_prefill_decode_derives_one_decode_execution() -> None:
-    config = dry_run(load_yaml(PREFILL_DECODE_CONFIG)).config
+    config = dry_run(load_yaml(PREFILL_DECODE_WITH_STACK_CONFIG)).config
 
     assert config.workload == "prefill_decode"
     assert config.prompt_len == 16384
@@ -275,14 +261,14 @@ def test_prefill_decode_derives_one_decode_execution() -> None:
 
 
 def test_prefill_decode_rejects_multiple_profile_iterations() -> None:
-    config = dry_run(load_yaml(PREFILL_DECODE_CONFIG)).config
+    config = dry_run(load_yaml(PREFILL_DECODE_WITH_STACK_CONFIG)).config
 
     with pytest.raises(ValueError, match="prefill_decode requires profile_iters=1"):
         validate_production_profile_config(replace(config, profile_iters=2))
 
 
 def test_prefill_decode_tp2_dp4_uses_two_local_requests() -> None:
-    config = dry_run(load_yaml(PREFILL_DECODE_TP2_DP4_CONFIG)).config
+    config = dry_run(load_yaml(PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG)).config
 
     kwargs = production_engine_args_kwargs(config)
     assert config.expert_parallel_size == 8
