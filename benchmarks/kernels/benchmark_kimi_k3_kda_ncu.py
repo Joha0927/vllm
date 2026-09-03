@@ -72,11 +72,21 @@ class ConvInputs:
 
 
 def _conv_inputs(tokens: int, dim: int) -> ConvInputs:
-    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+    from vllm.v1.attention.backends.utils import (
+        NULL_BLOCK_ID,
+        compute_causal_conv1d_metadata,
+    )
 
     x = torch.randn(tokens, dim, device="cuda", dtype=DTYPE).transpose(0, 1)
     weight = torch.randn(dim, CONV_WIDTH, device="cuda", dtype=torch.float32)
-    state = torch.zeros(1, dim, CONV_WIDTH - 1, device="cuda", dtype=DTYPE)
+    valid_state_slot = NULL_BLOCK_ID + 1
+    state = torch.zeros(
+        valid_state_slot + 1,
+        dim,
+        CONV_WIDTH - 1,
+        device="cuda",
+        dtype=DTYPE,
+    )
     starts = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
     nums, batch_ptr, offsets = compute_causal_conv1d_metadata(
         starts.cpu(), device=x.device
@@ -86,7 +96,9 @@ def _conv_inputs(tokens: int, dim: int) -> ConvInputs:
         weight=weight,
         state=state,
         starts=starts,
-        cache_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+        cache_indices=torch.full(
+            (1,), valid_state_slot, device="cuda", dtype=torch.int32
+        ),
         has_initial_state=torch.zeros(1, device="cuda", dtype=torch.bool),
         metadata=SimpleNamespace(
             nums_dict=nums,
@@ -124,7 +136,7 @@ def _check_conv() -> float:
     output_error = _check_close("prefill-conv1d", actual, F.silu(expected).to(DTYPE))
     state_error = _check_close(
         "prefill-conv1d-state",
-        inputs.state[0],
+        inputs.state[inputs.cache_indices.item()],
         inputs.x[:, -(CONV_WIDTH - 1) :],
     )
     return max(output_error, state_error)

@@ -318,6 +318,9 @@ metadata、执行小形状正确性检查并 warmup；warmup 后恢复可变 cac
 分析应将 Torch Profiler 用作 production 时延与调用顺序的依据，将 NCU 用于单 kernel
 的 SOL、memory、occupancy 等计数器。
 
+vLLM 将 state slot 0 保留为 `NULL_BLOCK_ID`。microbenchmark 使用 slot 1 作为有效
+conv/recurrent state；slot 0 会让 kernel 跳过请求，不能作为有效 profiling。
+
 ## 6. Production Engine 约束
 
 所有 workload 均使用：
