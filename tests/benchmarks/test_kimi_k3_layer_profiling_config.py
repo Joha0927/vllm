@@ -30,9 +30,9 @@ PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml"
 )
-PREFILL_DECODE_TP2_DP4_FLASHINFER_A2A_WITH_STACK_CONFIG = (
+PREFILL_DECODE_TP2_DP4_FLASHINFER_ONE_SIDED_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
-    "prefill_decode_bs8_p16384_tp2_dp4_flashinfer_a2a_with_stack.yaml"
+    "prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml"
 )
 
 
@@ -199,10 +199,10 @@ def test_torch_profile_with_stack_reaches_profiler_config(tmp_path: Path) -> Non
             True,
         ),
         (
-            PREFILL_DECODE_TP2_DP4_FLASHINFER_A2A_WITH_STACK_CONFIG,
+            PREFILL_DECODE_TP2_DP4_FLASHINFER_ONE_SIDED_WITH_STACK_CONFIG,
             2,
             4,
-            "flashinfer_nvlink_two_sided",
+            "flashinfer_nvlink_one_sided",
             True,
         ),
     ],

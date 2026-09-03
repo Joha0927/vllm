@@ -70,7 +70,7 @@ IDs，相同配置可复现输入。
 ```text
 策略 A: TP1 / DP8 / EP8 / DCP1 / AG+RS
 策略 B: TP2 / DP4 / EP8 / DCP1 / AG+RS
-策略 D: TP2 / DP4 / EP8 / DCP1 / FlashInfer NVLink two-sided A2A
+策略 D: TP2 / DP4 / EP8 / DCP1 / FlashInfer NVLink one-sided A2A
 ```
 
 启用 expert parallel 后，当前配置没有 PCP，因此：
@@ -85,7 +85,7 @@ EP = TP * DP
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | A | AG+RS | 1 | 8 | 8 | true | TP1 AG+RS 基线与源码归因 |
 | B | AG+RS | 2 | 4 | 8 | true | TP2 AG+RS 基线与源码归因 |
-| D | FlashInfer A2A | 2 | 4 | 8 | true | TP2 All-to-All 对照与源码归因 |
+| D | FlashInfer one-sided A2A | 2 | 4 | 8 | true | TP2 All-to-All 对照与源码归因 |
 
 三组 workload 均为每请求 16384-token prefill 加一次 single-token decode，全局 BS 为 8。
 所有组使用相同的 profiler 设置，因此只在这三组 trace 之间进行相对性能比较；with-stack
@@ -195,10 +195,12 @@ EP enabled 时，EP = TP * DP
 
 `all2all_backend` 决定 MoE token dispatch/combine 的通信实现，必须作为输入配置。当前已
 验证的基线是 `allgather_reducescatter`。新增对照为
-`flashinfer_nvlink_two_sided`，它使用 FlashInfer/TRT-LLM NVLink two-sided All-to-All，
-而不是 DeepEP。正式采集前必须独立 qualification，确认 FlashInfer comm 模块实际可用，
-且 runtime manager 已解析为目标实现。`naive` 和已删除的 `pplx` 不可作为真正 All-to-All
-对照，因为当前 vLLM 会将它们回退为 `allgather_reducescatter`。
+`flashinfer_nvlink_one_sided`，它使用 FlashInfer NVLink one-sided All-to-All，而不是
+DeepEP。Kimi-K3 在 H20 上使用的 MXFP4 Marlin experts 明确支持 one-sided，但不支持
+`flashinfer_nvlink_two_sided`。正式采集前必须独立 qualification，确认 FlashInfer comm
+模块实际可用，且 runtime manager 已解析为目标实现。`naive` 和已删除的 `pplx` 不可作为
+真正 All-to-All 对照，因为当前 vLLM 会将它们回退为
+`allgather_reducescatter`。
 
 `expert_placement_strategy` 决定 global experts 到 EP rank 的映射，基线为 `linear`。
 `enable_dbo` 控制 dual-batch overlap，基线为 `false`；开启后还必须记录 ubatch 和
@@ -335,7 +337,7 @@ max_num_batched_tokens >= 每个 DP engine 在该 step 的本地 prompt token �
 
 当前 production EngineCore、12-layer model loading、Torch Profiler worker traces、
 `layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现。
-正式矩阵包含 AG+RS 的 TP1/DP8 与 TP2/DP4，以及 FlashInfer two-sided A2A 的
+正式矩阵包含 AG+RS 的 TP1/DP8 与 TP2/DP4，以及 FlashInfer one-sided A2A 的
 TP2/DP4；每组在正式采集前单独 qualification。
 
 实现顺序：
@@ -424,5 +426,5 @@ benchmarks/kimi_k3_layer_profiling/
     ├── smoke.yaml
     ├── prefill_decode_bs8_p16384_with_stack.yaml
     ├── prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml
-    └── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_a2a_with_stack.yaml
+    └── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml
 ```
