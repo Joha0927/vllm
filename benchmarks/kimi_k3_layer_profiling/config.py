@@ -27,6 +27,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "decode_context_parallel_size": 1,
     "enable_dbo": False,
     "enable_expert_parallel": True,
+    "enable_layerwise_nvtx_tracing": False,
     "execution_mode": "eager",
     "expert_placement_strategy": "linear",
     "gpu_count": 8,
@@ -83,6 +84,7 @@ class BenchmarkConfig:
     data_parallel_size: int
     decode_context_parallel_size: int
     enable_expert_parallel: bool
+    enable_layerwise_nvtx_tracing: bool
     all2all_backend: str
     expert_placement_strategy: str
     enable_dbo: bool
@@ -144,6 +146,10 @@ class BenchmarkConfig:
     def local_batch_size(self) -> int:
         return self.batch_size // self.data_parallel_size
 
+    @property
+    def layerwise_nvtx_tracing_enabled(self) -> bool:
+        return self.enable_layerwise_nvtx_tracing or self.profile == "torch"
+
 
 @dataclass(frozen=True)
 class DryRunResult:
@@ -177,9 +183,9 @@ class DryRunResult:
             "data_parallel_size": config.data_parallel_size,
             "decode_context_parallel_size": config.decode_context_parallel_size,
             "dtype": config.dtype,
-            "execution_mode": config.execution_mode,
             "enable_dbo": config.enable_dbo,
             "enable_expert_parallel": config.enable_expert_parallel,
+            "enable_layerwise_nvtx_tracing": config.enable_layerwise_nvtx_tracing,
             "expert_parallel_size": config.expert_parallel_size,
             "expert_placement_strategy": config.expert_placement_strategy,
             "git_commit": None,
@@ -288,6 +294,10 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
         decode_context_parallel_size=int(values["decode_context_parallel_size"]),
         enable_expert_parallel=_require_bool(
             values["enable_expert_parallel"], "enable_expert_parallel"
+        ),
+        enable_layerwise_nvtx_tracing=_require_bool(
+            values["enable_layerwise_nvtx_tracing"],
+            "enable_layerwise_nvtx_tracing",
         ),
         all2all_backend=str(values["all2all_backend"]),
         expert_placement_strategy=str(values["expert_placement_strategy"]),

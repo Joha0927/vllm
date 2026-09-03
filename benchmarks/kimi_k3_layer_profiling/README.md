@@ -54,7 +54,7 @@ weight format           = dummy MXFP4
 language_model_only     = true
 prefix caching          = false
 execution mode          = eager
-profiler                = Torch Profiler
+profilers               = Torch Profiler、Nsight Compute
 MoE routing simulation  = uniform_random
 ```
 
@@ -68,9 +68,9 @@ IDs，相同配置可复现输入。
 使用全局 batch 8、EP8、DCP1，对比三种执行组合：
 
 ```text
-策略 A: TP1 / DP8 / EP8 / DCP1 / AG+RS
-策略 B: TP2 / DP4 / EP8 / DCP1 / AG+RS
-策略 D: TP2 / DP4 / EP8 / DCP1 / FlashInfer NVLink one-sided A2A
+TP1 / DP8 / EP8 / DCP1 / AG+RS
+TP2 / DP4 / EP8 / DCP1 / AG+RS
+TP2 / DP4 / EP8 / DCP1 / FlashInfer NVLink one-sided A2A
 ```
 
 启用 expert parallel 后，当前配置没有 PCP，因此：
@@ -81,11 +81,11 @@ EP = TP * DP
 
 三种执行组合均采集 with-stack trace：
 
-| 组 | All-to-All | TP | DP | EP | with-stack | 用途 |
-| --- | --- | ---: | ---: | ---: | --- | --- |
-| A | AG+RS | 1 | 8 | 8 | true | TP1 AG+RS 基线与源码归因 |
-| B | AG+RS | 2 | 4 | 8 | true | TP2 AG+RS 基线与源码归因 |
-| D | FlashInfer one-sided A2A | 2 | 4 | 8 | true | TP2 All-to-All 对照与源码归因 |
+| 并行与通信策略 | TP | DP | EP | with-stack | 用途 |
+| --- | ---: | ---: | ---: | --- | --- |
+| TP1/DP8/EP8 + AG+RS | 1 | 8 | 8 | true | TP1 基线与源码归因 |
+| TP2/DP4/EP8 + AG+RS | 2 | 4 | 8 | true | TP2 基线与源码归因 |
+| TP2/DP4/EP8 + FlashInfer one-sided A2A | 2 | 4 | 8 | true | TP2 A2A 对照与源码归因 |
 
 三组 workload 均为每请求 16384-token prefill 加一次 single-token decode，全局 BS 为 8。
 所有组使用相同的 profiler 设置，因此只在这三组 trace 之间进行相对性能比较；with-stack
@@ -286,16 +286,51 @@ warmup_iters        = 3
 profile_iters       = 1
 profile             = torch
 profile_output_dir  = 每次运行唯一目录
-profiler_with_stack = false（正式性能）或 true（调用栈归因）
+profiler_with_stack = true（当前正式 Torch trace）
+enable_layerwise_nvtx_tracing = 是否独立注册模块级 NVTX 范围
 ```
 
 结果目录不按 Git commit 分层。每次使用实验名和时间戳创建目录，commit 写入
 `run_meta.txt`。
 
 `profiler_with_stack=true` 会记录 Python 调用栈，但会增加 CPU profiler 开销和 trace
-体积，因此只用于定位 `CUDA kernel -> CPU op -> Python function/module`。正式性能对比
-必须使用 `false`。启用后应验证目标 CPU op 含非空 Python stack frame，并能通过
-correlation/flow 关联到 CUDA kernel；不能只检查是否存在名为 `python_function` 的事件。
+体积。当前三组正式 Torch trace 全部使用相同设置，只做组间相对比较。启用后应验证目标
+CPU op 含非空 Python stack frame，并能通过 correlation/flow 关联到 CUDA kernel；不能
+只检查是否存在名为 `python_function` 的事件。
+
+### 5.5 Nsight Compute
+
+NCU 不与 Torch Profiler 同时开启。NCU 配置必须使用：
+
+```text
+profile                        = none
+profiler_with_stack            = false
+enable_layerwise_nvtx_tracing  = true
+```
+
+独立 NVTX 开关让 production worker 为所有 PyTorch 子模块注册 NVTX，同时不创建 Torch
+Profiler。NCU 仅采 GPU 0，即单机 rank 0，并用模块范围过滤目标 kernel。
+
+固定 TP2/DP4/EP8 时，KDA、MLA 和 Dense 不受 MoE `all2all_backend` 直接影响，各采
+prefill/decode 一次；MoE 分别采 AG+RS 和 FlashInfer one-sided A2A。正式 NCU 矩阵为：
+
+| 并行与通信策略 | 阶段 | 模块 | 代表范围 |
+| --- | --- | --- | --- |
+| TP2/DP4/EP8 | prefill | KDA | `layers.1.self_attn` |
+| TP2/DP4/EP8 | decode | KDA | `layers.1.self_attn` |
+| TP2/DP4/EP8 | prefill | MLA | `layers.3.self_attn` |
+| TP2/DP4/EP8 | decode | MLA | `layers.3.self_attn` |
+| TP2/DP4/EP8 | prefill | Dense | `layers.0.mlp` |
+| TP2/DP4/EP8 | decode | Dense | `layers.0.mlp` |
+| TP2/DP4/EP8 + AG+RS | prefill | MoE | `layers.1.block_sparse_moe` |
+| TP2/DP4/EP8 + AG+RS | decode | MoE | `layers.1.block_sparse_moe` |
+| TP2/DP4/EP8 + FlashInfer one-sided A2A | prefill | MoE | `layers.1.block_sparse_moe` |
+| TP2/DP4/EP8 + FlashInfer one-sided A2A | decode | MoE | `layers.1.block_sparse_moe` |
+
+同一 `prefill_decode` 请求会进入目标模块两次。正式详细采集前必须先做一次轻量 NCU
+NVTX inventory，记录 production trace 中准确的模块范围文本和两次调用的 input shape；
+后续分别按 shape 过滤 prefill 与 decode。不能把同名 kernel 的两次调用聚合成一个结果。
+分布式通信 kernel 使用 application replay，避免单独 kernel replay 破坏 collective 同步。
 
 ## 6. Production Engine 约束
 
@@ -415,7 +450,6 @@ exit code
 ```text
 benchmarks/kimi_k3_layer_profiling/
 ├── README.md
-├── EXTEND_PREFILL_PLAN.md
 ├── __init__.py
 ├── benchmark.py
 ├── config.py
@@ -424,6 +458,8 @@ benchmarks/kimi_k3_layer_profiling/
 │   └── config.json
 └── shapes/
     ├── smoke.yaml
+    ├── ncu_tp2_dp4_ep8_ag_rs.yaml
+    ├── ncu_tp2_dp4_ep8_flashinfer_one_sided.yaml
     ├── prefill_decode_bs8_p16384_with_stack.yaml
     ├── prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml
     └── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml

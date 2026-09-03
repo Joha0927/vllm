@@ -1,0 +1,31 @@
+# Required workload inputs.
+workload: prefill_decode
+batch_size: 8
+history_len: 16384
+query_len: 1
+
+# NCU profiles GPU 0 and filters these module-level NVTX ranges.
+tensor_parallel_size: 2
+data_parallel_size: 4
+decode_context_parallel_size: 1
+enable_expert_parallel: true
+enable_layerwise_nvtx_tracing: true
+all2all_backend: allgather_reducescatter
+expert_placement_strategy: linear
+enable_dbo: false
+moe_backend: auto
+linear_backend: auto
+attention_backend: auto
+kda_prefill_backend: auto
+mla_prefill_backend: auto
+kv_cache_dtype: auto
+kv_cache_memory_bytes: 4294967296
+shard_sp_shared_expert: false
+execution_mode: eager
+routing_strategy: uniform_random
+warmup_iters: 3
+profile_iters: 1
+profile: none
+profiler_with_stack: false
+gpu_count: 8
+random_seed: 0
