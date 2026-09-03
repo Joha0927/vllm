@@ -39,6 +39,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "profile": "none",
     "profile_iters": 1,
     "profile_output_dir": None,
+    "profiler_with_stack": False,
     "random_seed": 0,
     "routing_strategy": "uniform_random",
     "shard_sp_shared_expert": False,
@@ -99,6 +100,7 @@ class BenchmarkConfig:
     profile_iters: int
     profile: str
     profile_output_dir: str | None
+    profiler_with_stack: bool
     gpu_count: int
     random_seed: int
 
@@ -209,6 +211,7 @@ class DryRunResult:
             "profile": config.profile,
             "profile_output_dir": config.profile_output_dir,
             "profile_iters": config.profile_iters,
+            "profiler_with_stack": config.profiler_with_stack,
             "profiling_unit": "block",
             "query_lengths": [config.query_len] * config.batch_size,
             "random_seed": config.random_seed,
@@ -308,6 +311,9 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
             str(values["profile_output_dir"])
             if values["profile_output_dir"] is not None
             else None
+        ),
+        profiler_with_stack=_require_bool(
+            values["profiler_with_stack"], "profiler_with_stack"
         ),
         gpu_count=int(values["gpu_count"]),
         random_seed=int(values["random_seed"]),

@@ -29,6 +29,10 @@ PREFILL_DECODE_TP2_DP4_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_tp2_dp4.yaml"
 )
+PREFILL_DECODE_WITH_STACK_CONFIG = (
+    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+    "prefill_decode_bs8_p16384_with_stack.yaml"
+)
 
 
 def _config():
@@ -74,6 +78,7 @@ def test_performance_path_defaults_are_explicit() -> None:
     assert config.expert_placement_strategy == "linear"
     assert config.enable_dbo is False
     assert config.shard_sp_shared_expert is False
+    assert config.profiler_with_stack is False
     assert config.local_batch_size == 1
 
 
@@ -160,6 +165,25 @@ def test_torch_profile_config_has_an_absolute_rank_output_dir(tmp_path: Path) ->
     assert profiler_config.torch_profiler_record_shapes is True
     assert profiler_config.torch_profiler_with_memory is False
     assert profiler_config.torch_profiler_with_stack is False
+
+
+def test_torch_profile_with_stack_reaches_profiler_config(tmp_path: Path) -> None:
+    config = replace(
+        dry_run(load_yaml(PREFILL_DECODE_WITH_STACK_CONFIG)).config,
+        profile="torch",
+        profile_output_dir=str(tmp_path / "traces"),
+    )
+
+    kwargs = production_engine_args_kwargs(config)
+
+    assert kwargs["profiler_config"].torch_profiler_with_stack is True
+    assert production_profile_evidence(config)["profiler_with_stack"] is True
+    assert (
+        dry_run(load_yaml(PREFILL_DECODE_WITH_STACK_CONFIG)).manifest()[
+            "profiler_with_stack"
+        ]
+        is True
+    )
 
 
 def test_production_evidence_records_current_execution_path() -> None:
@@ -267,6 +291,7 @@ def test_cli_exposes_performance_path_overrides() -> None:
             "--mla-prefill-backend",
             "flashinfer",
             "--shard-sp-shared-expert",
+            "--profiler-with-stack",
         ]
     )
 
@@ -275,6 +300,17 @@ def test_cli_exposes_performance_path_overrides() -> None:
     assert args.kda_prefill_backend == "flashkda"
     assert args.mla_prefill_backend == "flashinfer"
     assert args.shard_sp_shared_expert is True
+    assert args.profiler_with_stack is True
+
+    disabled = parse_args(
+        [
+            "--config",
+            str(PREFILL_DECODE_WITH_STACK_CONFIG),
+            "--dry-run",
+            "--no-profiler-with-stack",
+        ]
+    )
+    assert disabled.profiler_with_stack is False
 
 
 def test_cli_exposes_workload_overrides() -> None:
@@ -374,6 +410,14 @@ def test_boolean_fields_reject_string_values() -> None:
     data["enable_dbo"] = "false"
 
     with pytest.raises(ValueError, match="enable_dbo must be a boolean"):
+        dry_run(data)
+
+
+def test_profiler_with_stack_rejects_string_values() -> None:
+    data = load_yaml(SMOKE_CONFIG)
+    data["profiler_with_stack"] = "false"
+
+    with pytest.raises(ValueError, match="profiler_with_stack must be a boolean"):
         dry_run(data)
 
 

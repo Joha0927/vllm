@@ -80,7 +80,7 @@ def production_engine_args_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
             torch_profiler_dir=str(profile_output_dir),
             torch_profiler_record_shapes=True,
             torch_profiler_with_memory=False,
-            torch_profiler_with_stack=False,
+            torch_profiler_with_stack=config.profiler_with_stack,
         )
     return kwargs
 
@@ -115,6 +115,7 @@ def production_profile_evidence(config: BenchmarkConfig) -> dict[str, Any]:
         "tensor_parallel_size": config.tensor_parallel_size,
         "profile": config.profile,
         "profile_output_dir": config.profile_output_dir,
+        "profiler_with_stack": config.profiler_with_stack,
         "query_len": config.query_len,
         "warmup_iters": config.warmup_iters,
         "workload": config.workload,

@@ -25,5 +25,6 @@ routing_strategy: uniform_random
 warmup_iters: 1
 profile_iters: 1
 profile: none
+profiler_with_stack: false
 gpu_count: 8
 random_seed: 0

@@ -40,6 +40,7 @@ _OVERRIDE_FIELDS = (
     "profile_iters",
     "profile",
     "profile_output_dir",
+    "profiler_with_stack",
     "gpu_count",
     "random_seed",
 )
@@ -107,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-iters", type=int)
     parser.add_argument("--profile", choices=("none", "torch"))
     parser.add_argument("--profile-output-dir")
+    parser.add_argument(
+        "--profiler-with-stack",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--gpu-count", type=int)
     parser.add_argument("--random-seed", type=int)
     return parser

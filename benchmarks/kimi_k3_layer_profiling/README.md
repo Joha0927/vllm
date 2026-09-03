@@ -275,10 +275,16 @@ warmup_iters        = 3
 profile_iters       = 1
 profile             = torch
 profile_output_dir  = 每次运行唯一目录
+profiler_with_stack = false（正式性能）或 true（调用栈归因）
 ```
 
 结果目录不按 Git commit 分层。每次使用实验名和时间戳创建目录，commit 写入
 `run_meta.txt`。
+
+`profiler_with_stack=true` 会记录 Python 调用栈，但会增加 CPU profiler 开销和 trace
+体积，因此只用于定位 `CUDA kernel -> CPU op -> Python function/module`。正式性能对比
+必须使用 `false`。启用后应验证目标 CPU op 含非空 Python stack frame，并能通过
+correlation/flow 关联到 CUDA kernel；不能只检查是否存在名为 `python_function` 的事件。
 
 ## 6. Production Engine 约束
 
@@ -406,5 +412,6 @@ benchmarks/kimi_k3_layer_profiling/
 └── shapes/
     ├── smoke.yaml
     ├── prefill_decode_bs8_p16384.yaml
-    └── prefill_decode_bs8_p16384_tp2_dp4.yaml
+    ├── prefill_decode_bs8_p16384_tp2_dp4.yaml
+    └── prefill_decode_bs8_p16384_with_stack.yaml
 ```
