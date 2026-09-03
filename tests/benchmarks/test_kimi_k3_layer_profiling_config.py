@@ -34,13 +34,6 @@ PREFILL_DECODE_TP2_DP4_FLASHINFER_ONE_SIDED_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml"
 )
-NCU_TP2_DP4_AG_RS_CONFIG = (
-    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/ncu_tp2_dp4_ep8_ag_rs.yaml"
-)
-NCU_TP2_DP4_FLASHINFER_ONE_SIDED_CONFIG = (
-    ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
-    "ncu_tp2_dp4_ep8_flashinfer_one_sided.yaml"
-)
 
 
 def _config():
@@ -87,8 +80,6 @@ def test_performance_path_defaults_are_explicit() -> None:
     assert config.enable_dbo is False
     assert config.shard_sp_shared_expert is False
     assert config.profiler_with_stack is False
-    assert config.enable_layerwise_nvtx_tracing is False
-    assert config.layerwise_nvtx_tracing_enabled is False
     assert config.local_batch_size == 1
 
 
@@ -194,35 +185,6 @@ def test_torch_profile_with_stack_reaches_profiler_config(tmp_path: Path) -> Non
         ]
         is True
     )
-
-
-@pytest.mark.parametrize(
-    ("path", "all2all_backend"),
-    [
-        (NCU_TP2_DP4_AG_RS_CONFIG, "allgather_reducescatter"),
-        (
-            NCU_TP2_DP4_FLASHINFER_ONE_SIDED_CONFIG,
-            "flashinfer_nvlink_one_sided",
-        ),
-    ],
-)
-def test_ncu_configs_enable_nvtx_without_torch_profiler(
-    path: Path, all2all_backend: str
-) -> None:
-    config = dry_run(load_yaml(path)).config
-
-    kwargs = production_engine_args_kwargs(config)
-    evidence = production_profile_evidence(config)
-
-    assert config.tensor_parallel_size == 2
-    assert config.data_parallel_size == 4
-    assert config.expert_parallel_size == 8
-    assert config.all2all_backend == all2all_backend
-    assert config.profile == "none"
-    assert config.enable_layerwise_nvtx_tracing is True
-    assert kwargs["enable_layerwise_nvtx_tracing"] is True
-    assert "profiler_config" not in kwargs
-    assert evidence["layerwise_profiler_scopes"] is True
 
 
 @pytest.mark.parametrize(
@@ -496,16 +458,6 @@ def test_profiler_with_stack_rejects_string_values() -> None:
     data["profiler_with_stack"] = "false"
 
     with pytest.raises(ValueError, match="profiler_with_stack must be a boolean"):
-        dry_run(data)
-
-
-def test_layerwise_nvtx_rejects_string_values() -> None:
-    data = load_yaml(SMOKE_CONFIG)
-    data["enable_layerwise_nvtx_tracing"] = "false"
-
-    with pytest.raises(
-        ValueError, match="enable_layerwise_nvtx_tracing must be a boolean"
-    ):
         dry_run(data)
 
 

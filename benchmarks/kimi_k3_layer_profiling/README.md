@@ -287,7 +287,6 @@ profile_iters       = 1
 profile             = torch
 profile_output_dir  = 每次运行唯一目录
 profiler_with_stack = true（当前正式 Torch trace）
-enable_layerwise_nvtx_tracing = 是否独立注册模块级 NVTX 范围
 ```
 
 结果目录不按 Git commit 分层。每次使用实验名和时间戳创建目录，commit 写入
@@ -300,37 +299,24 @@ CPU op 含非空 Python stack frame，并能通过 correlation/flow 关联到 CU
 
 ### 5.5 Nsight Compute
 
-NCU 不与 Torch Profiler 同时开启。NCU 配置必须使用：
+详细硬件计数器使用独立的单 GPU microbenchmark：
+`benchmarks/kernels/benchmark_kimi_k3_kda_ncu.py`。它调用 vLLM production kernel
+入口，但不启动 LLM、EngineCore 或分布式通信，因此结果不能当作端到端 latency。
 
-```text
-profile                        = none
-profiler_with_stack            = false
-enable_layerwise_nvtx_tracing  = true
-```
+固定形状为 BS1、prefill 16384 tokens、decode 1 token、96 heads、head dim 128、
+conv width 4、BF16。每次只选择一个目标：
 
-独立 NVTX 开关让 production worker 为所有 PyTorch 子模块注册 NVTX，同时不创建 Torch
-Profiler。NCU 仅采 GPU 0，即单机 rank 0，并用模块范围过滤目标 kernel。
+| `--target` | NVTX 范围 | 含义 |
+| --- | --- | --- |
+| `prefill-conv1d` | `kimi_k3_kda_ncu/prefill_conv1d` | 一次真实 prefill causal-conv1d；production Q/K/V 共调用三次 |
+| `prefill-kda` | `kimi_k3_kda_ncu/prefill_kda` | FlashKDA prefill，不包含前置 conv1d |
+| `decode-fused` | `kimi_k3_kda_ncu/decode_fused` | H20 production fused decode，包含 conv update、recurrent KDA、gate 和 RMSNorm |
 
-固定 TP2/DP4/EP8 时，KDA、MLA 和 Dense 不受 MoE `all2all_backend` 直接影响，各采
-prefill/decode 一次；MoE 分别采 AG+RS 和 FlashInfer one-sided A2A。正式 NCU 矩阵为：
-
-| 并行与通信策略 | 阶段 | 模块 | 代表范围 |
-| --- | --- | --- | --- |
-| TP2/DP4/EP8 | prefill | KDA | `layers.1.self_attn` |
-| TP2/DP4/EP8 | decode | KDA | `layers.1.self_attn` |
-| TP2/DP4/EP8 | prefill | MLA | `layers.3.self_attn` |
-| TP2/DP4/EP8 | decode | MLA | `layers.3.self_attn` |
-| TP2/DP4/EP8 | prefill | Dense | `layers.0.mlp` |
-| TP2/DP4/EP8 | decode | Dense | `layers.0.mlp` |
-| TP2/DP4/EP8 + AG+RS | prefill | MoE | `layers.1.block_sparse_moe` |
-| TP2/DP4/EP8 + AG+RS | decode | MoE | `layers.1.block_sparse_moe` |
-| TP2/DP4/EP8 + FlashInfer one-sided A2A | prefill | MoE | `layers.1.block_sparse_moe` |
-| TP2/DP4/EP8 + FlashInfer one-sided A2A | decode | MoE | `layers.1.block_sparse_moe` |
-
-同一 `prefill_decode` 请求会进入目标模块两次。正式详细采集前必须先做一次轻量 NCU
-NVTX inventory，记录 production trace 中准确的模块范围文本和两次调用的 input shape；
-后续分别按 shape 过滤 prefill 与 decode。不能把同名 kernel 的两次调用聚合成一个结果。
-分布式通信 kernel 使用 application replay，避免单独 kernel replay 破坏 collective 同步。
+脚本仅允许 NVIDIA H20（SM90）。它在 NVTX 之外创建输入、预构造 production conv
+metadata、执行小形状正确性检查并 warmup；warmup 后恢复可变 cache，NVTX 内只执行
+一次目标调用。`profile_iters` 固定为 1，因为 conv/recurrent cache 会原地更新。正式
+分析应将 Torch Profiler 用作 production 时延与调用顺序的依据，将 NCU 用于单 kernel
+的 SOL、memory、occupancy 等计数器。
 
 ## 6. Production Engine 约束
 
@@ -458,8 +444,6 @@ benchmarks/kimi_k3_layer_profiling/
 │   └── config.json
 └── shapes/
     ├── smoke.yaml
-    ├── ncu_tp2_dp4_ep8_ag_rs.yaml
-    ├── ncu_tp2_dp4_ep8_flashinfer_one_sided.yaml
     ├── prefill_decode_bs8_p16384_with_stack.yaml
     ├── prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml
     └── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml

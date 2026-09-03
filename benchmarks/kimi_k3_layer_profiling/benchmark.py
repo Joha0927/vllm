@@ -23,7 +23,6 @@ _OVERRIDE_FIELDS = (
     "data_parallel_size",
     "decode_context_parallel_size",
     "enable_expert_parallel",
-    "enable_layerwise_nvtx_tracing",
     "all2all_backend",
     "expert_placement_strategy",
     "enable_dbo",
@@ -70,11 +69,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decode-context-parallel-size", type=int)
     parser.add_argument(
         "--enable-expert-parallel",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--enable-layerwise-nvtx-tracing",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
