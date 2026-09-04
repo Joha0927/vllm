@@ -321,6 +321,25 @@ metadata、执行小形状正确性检查并 warmup；warmup 后恢复可变 cac
 vLLM 将 state slot 0 保留为 `NULL_BLOCK_ID`。microbenchmark 使用 slot 1 作为有效
 conv/recurrent state；slot 0 会让 kernel 跳过请求，不能作为有效 profiling。
 
+MLA 和 AttnRes 的补充硬件计数器使用
+`benchmarks/kernels/benchmark_kimi_k3_mla_attn_res_ncu.py`，固定为单 H20、BF16、
+TP1 本地 shape。它提供五个互不重叠的 target：
+
+| `--target` | Production 语义 |
+| --- | --- |
+| `mla-kv-insert` | NoPE BF16 key concat 与 768-token paged KV cache insert |
+| `attn-res-prefill` | 16K tokens、一个既有 block、fused delta 与 output norm |
+| `attn-res-decode` | 单 token、一个既有 block、decode Triton specialization |
+| `attn-res-block-write` | 首个 block-write layer：`num_blocks=0, block_write_idx=0` |
+| `mla-fa-prefill` | BS1、Q=KV=16K、causal FlashAttention MLA prefill |
+
+MLA `slot_mapping` 与 KDA state slot 的 sentinel 规则不同：MLA cache slot 0 有效，
+负数 slot 才表示跳过写入。AttnRes 在 H20 上必须解析为 Triton kernel；SM100-only
+原生 CUDA fast path 不是 H20 的 production 路径。MLA FA 范围可能包含多个 production
+kernel，不能用“kernel 数必须等于 1”作为验收条件。`attn-res-block-write` 对应
+`layer_idx=0` 的 pre-attention block write；普通 prefill/decode 对应下一层读取该 block。
+MLA 的 split/slice 输入保留 production stride，而不是改成同 shape 的连续张量。
+
 ## 6. Production Engine 约束
 
 所有 workload 均使用：
