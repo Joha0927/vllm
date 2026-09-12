@@ -172,7 +172,7 @@ def _prepare_mla_kv_insert() -> PreparedTarget:
 @dataclass
 class AttnResInputs:
     prefix: torch.Tensor
-    delta: torch.Tensor
+    delta: torch.Tensor | None
     blocks: torch.Tensor
     norm_weight: torch.Tensor
     qk_weight: torch.Tensor
@@ -185,7 +185,11 @@ def _attn_res_inputs(tokens: int, *, write_block: bool) -> AttnResInputs:
     num_blocks = 0 if write_block else 1
     return AttnResInputs(
         prefix=torch.randn(tokens, HIDDEN_SIZE, device="cuda", dtype=DTYPE),
-        delta=torch.randn(tokens, HIDDEN_SIZE, device="cuda", dtype=DTYPE),
+        delta=(
+            None
+            if write_block
+            else torch.randn(tokens, HIDDEN_SIZE, device="cuda", dtype=DTYPE)
+        ),
         blocks=torch.randn(tokens, 1, HIDDEN_SIZE, device="cuda", dtype=DTYPE),
         norm_weight=1 + 0.1 * torch.randn(HIDDEN_SIZE, device="cuda", dtype=DTYPE),
         qk_weight=torch.randn(HIDDEN_SIZE, device="cuda", dtype=DTYPE)
@@ -215,7 +219,7 @@ def _run_attn_res(x: AttnResInputs) -> torch.Tensor:
 
 
 def _attn_res_reference(x: AttnResInputs) -> tuple[torch.Tensor, torch.Tensor]:
-    updated_prefix = (x.prefix + x.delta).to(DTYPE)
+    updated_prefix = x.prefix if x.delta is None else (x.prefix + x.delta).to(DTYPE)
     values = torch.cat(
         (x.blocks[:, : x.num_blocks], updated_prefix.unsqueeze(1)), dim=1
     )
@@ -263,7 +267,7 @@ def _prepare_attn_res(target: str) -> PreparedTarget:
             "hidden_size": HIDDEN_SIZE,
             "num_blocks": x.num_blocks,
             "block_write_idx": x.block_write_idx,
-            "has_delta": True,
+            "has_delta": x.delta is not None,
             "apply_output_norm": True,
             "backend": "triton",
         },

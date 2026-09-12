@@ -87,31 +87,84 @@ EP = TP * DP
 | TP2/DP4/EP8 + AG+RS | 2 | 4 | 8 | true | TP2 基线与源码归因 |
 | TP2/DP4/EP8 + FlashInfer one-sided A2A | 2 | 4 | 8 | true | TP2 A2A 对照与源码归因 |
 
-三组 workload 均为每请求 16384-token prefill 加一次 single-token decode，全局 BS 为 8。
+三组 workload 均为每请求 4096-token prefill 加一次 single-token decode，全局 BS 为 32。
 所有组使用相同的 profiler 设置，因此只在这三组 trace 之间进行相对性能比较；with-stack
 开销意味着 trace latency 不能直接视为无 profiler 时的线上绝对 latency。
 
-TP1/DP8 时每个 DP rank 处理 1 个请求；TP2/DP4 时每个 DP rank 处理 2 个请求。
+TP1/DP8 时每个 DP rank 处理 4 个请求；TP2/DP4 时每个 DP rank 处理 8 个请求。
 runner 必须显式分配并记录 request-to-DP 映射，不能只根据全局 batch 推测本地 batch。
 
 ## 4. Workload 定义
 
-### 4.1 Prefill + decode
+### 4.1 BS32/P4096 对照矩阵
 
-每个请求输入 16384 tokens，并生成 2 个 output tokens：
+当前正式矩阵使用以下同总 token 规模的 prefill+decode 配置：
 
 ```text
-prompt/request        = 16384
-prefill tokens/global = 8 * 16384 = 131072
-generated tokens/global = 8 * 2 = 16
-decode input tokens/global = 8 * 1 = 8
+TP1/DP8/EP8 + AG+RS
+TP2/DP4/EP8 + AG+RS
+TP2/DP4/EP8 + FlashInfer NVLink one-sided A2A
+
+global batch = 32
+prompt/request = 4096
+max_tokens/request = 2
+global prefill tokens = 131072
+```
+
+配置文件位于 `shapes/prefill_decode_bs32_p4096_*.yaml`。原有 BS8/P16384 结果只作为
+历史数据保留，不与当前矩阵混合比较。
+
+### 4.2 TP all-gather 同步对照
+
+`tp_sync_before_all_gather` 默认是 `false`。只允许在 TP>1 时显式打开。打开后，
+benchmark 专用 worker extension 会在 Kimi 模型的每次 `sp_all_gather` 前先等待本 rank
+GPU 工作完成，再通过 TP CPU group 对齐 ranks，并记录：
+
+```text
+kimi_k3.tp_sync.cuda_drain
+kimi_k3.tp_sync.host_barrier
+kimi_k3.tp_collective.sp_all_gather
+```
+
+这是扰动 production 执行的 ablation，必须与未同步的原始 trace 成对采集。同步组的
+collective 近似通信本身；原始组与同步组的差值只能解释为 arrival-skew 估计，不能当作
+严格可加的线上 latency 分解。每组应独立运行至少五次，逐样本先取 TP ranks 的最大值，
+再报告中位数。
+
+层间归因时要注意：`layers.N` 开头的 all-gather 等待的是各 rank 完成前一段工作，因此
+内部 `layers.N` 的到达偏差主要归因于 `layers.N-1` 的尾部，而不是当前层的 attention。
+首层 gather 还包含 embedding/输入准备差异，模型末尾的 gather 也不属于下一 decoder
+layer；二者不参与 KDA/MLA 层间对照。
+
+### 4.3 专家负载审计
+
+`capture_routed_experts` 默认是 `false`。打开时复用 vLLM production
+`enable_return_routed_experts` 路径，按 prefill/decode、layer、global expert 和 EP rank
+输出 assignment 数、实际命中的本地专家数与逐专家 histogram。审计模式强制
+`profile=none`，避免 routed-expert buffer、D2H copy 和汇总工作污染正式 Torch trace。
+
+审计输出的 `hbm_bytes_scope` 固定为 `not_measured`。其中
+`cold_unique_expert_weight_bytes_estimate` 只是按 MXFP4 checkpoint 表示计算的“每个命中
+专家从冷内存读取一次”估算，不是上下界。实际 HBM DRAM bytes 受 L2、kernel tiling、
+量化 scale、padding 和重复读取影响，必须由硬件计数器测量，不能用“命中专家数 × 权重
+大小”冒充实测值。
+
+### 4.4 Prefill + decode
+
+每个请求输入 4096 tokens，并生成 2 个 output tokens：
+
+```text
+prompt/request        = 4096
+prefill tokens/global = 32 * 4096 = 131072
+generated tokens/global = 32 * 2 = 64
+decode input tokens/global = 32 * 1 = 32
 max_tokens            = 2
 ```
 
 Profiler 在请求开始前启动，同一份 trace 记录：
 
 ```text
-完整 16K prefill
+完整 4K prefill
   -> 一次单-token decode
 ```
 
@@ -119,7 +172,7 @@ Profiler 在请求开始前启动，同一份 trace 记录：
 生产语义为：
 
 ```text
-model execution #1: 输入 16384 个 prompt tokens
+model execution #1: 输入 4096 个 prompt tokens
                     -> full-prefill forward
                     -> 根据末位 logits 采样 output token #1
 
@@ -130,7 +183,7 @@ model execution #2: 输入上一步的 output token #1
 
 因此，`max_tokens=1` 只会有 prefill forward，不能证明 decode 已执行；
 `max_tokens=2` 才会在 prefill 之后再触发一次真实 decode forward。运行时还必须设置
-`ignore_eos=true`，不配置其他 stop token，并使 `max_model_len >= 16384 + 2`，否则请求
+`ignore_eos=true`，不配置其他 stop token，并使 `max_model_len >= 4096 + 2`，否则请求
 可能在 decode 之前提前停止。
 
 每份 worker trace 中，每个 `layers.0..11` 应出现两次：第一次是 full
@@ -159,7 +212,7 @@ random_seed         token IDs 随机种子
 正式配置为：
 
 ```text
-Prefill+decode: workload=prefill_decode, history_len=16384, query_len=1
+Prefill+decode: workload=prefill_decode, history_len=4096, query_len=1
 ```
 
 `prefill_decode` 的 `max_tokens` 由 workload 固定推导为 2，不作为用户可任意调整的
@@ -169,7 +222,7 @@ YAML 参数。实际设置位于 `production_profile.py` 的 `SamplingParams`，
 `full_prefill` 只用于 qualification：
 
 ```text
-Full prefill: workload=full_prefill, history_len=0, query_len=16384
+Full prefill: workload=full_prefill, history_len=0, query_len=4096
 ```
 
 ### 5.2 并行和通信
@@ -330,14 +383,16 @@ TP1 本地 shape。它提供五个互不重叠的 target：
 | `mla-kv-insert` | NoPE BF16 key concat 与 768-token paged KV cache insert |
 | `attn-res-prefill` | 16K tokens、一个既有 block、fused delta 与 output norm |
 | `attn-res-decode` | 单 token、一个既有 block、decode Triton specialization |
-| `attn-res-block-write` | 首个 block-write layer：`num_blocks=0, block_write_idx=0` |
+| `attn-res-block-write` | Layer 0 pre-attention：embedding prefix 写入 block 0，`delta=None` |
 | `mla-fa-prefill` | BS1、Q=KV=16K、causal FlashAttention MLA prefill |
 
 MLA `slot_mapping` 与 KDA state slot 的 sentinel 规则不同：MLA cache slot 0 有效，
 负数 slot 才表示跳过写入。AttnRes 在 H20 上必须解析为 Triton kernel；SM100-only
 原生 CUDA fast path 不是 H20 的 production 路径。MLA FA 范围可能包含多个 production
 kernel，不能用“kernel 数必须等于 1”作为验收条件。`attn-res-block-write` 对应
-`layer_idx=0` 的 pre-attention block write；普通 prefill/decode 对应下一层读取该 block。
+`layer_idx=0` 的 pre-attention block write：embedding 已经是 live prefix，`num_blocks=0`
+表示还没有已提交的历史 block 可供读取，并不表示丢弃 embedding。普通 prefill/decode
+对应下一层读取该 block。
 MLA 的 split/slice 输入保留 production stride，而不是改成同 shape 的连续张量。
 
 ## 6. Production Engine 约束
@@ -376,19 +431,108 @@ max_num_batched_tokens >= 每个 DP engine 在该 step 的本地 prompt token �
 上述数值必须在 evidence 中记录实际解析结果。不能只根据
 `max_tokens=2` 就推断 trace 一定是“一次 prefill + 一次 decode”。
 
-## 7. 实现状态和下一步
+## 7. 实验清单与执行顺序
 
-当前 production EngineCore、12-layer model loading、Torch Profiler worker traces、
-`layers.0..11` scope、requested backend 输入和 Prefill+decode workload 已经实现。
-正式矩阵包含 AG+RS 的 TP1/DP8 与 TP2/DP4，以及 FlashInfer one-sided A2A 的
-TP2/DP4；每组在正式采集前单独 qualification。
+本轮正式输入统一为 global BS32、每请求 4096-token prefill、生成 2 个 token。旧的
+BS8/P16384 trace 作为历史结果保留，不属于本轮执行队列。每个实验使用独立的时间戳目录，
+结果目录不按 commit 分层。
 
-实现顺序：
+### 7.1 实验清单
 
-1. 对目标并行和 All-to-All 配置先执行 qualification；
-2. 为每种组合采集 `profiler_with_stack=true` 的 trace；
-3. 仅在使用相同 profiler 设置的三组之间做相对比较；
-4. 汇总 layer、kernel、All-to-All/NCCL、rank-max latency 和峰值显存。
+| ID | 配置 | 附加开关 | 目的 |
+| --- | --- | --- | --- |
+| K-Q-A | TP1/DP8/EP8 + AG+RS | `profile=none` | 验证 shape、拓扑、模型和 backend |
+| K-Q-B | TP2/DP4/EP8 + AG+RS | `profile=none` | 验证 TP2 AG+RS production 路径 |
+| K-Q-D | TP2/DP4/EP8 + one-sided A2A | `profile=none` | 验证 FlashInfer A2A production 路径 |
+| K-R-A | TP1/DP8/EP8 + AG+RS | `capture_routed_experts=true` | 记录各 layer、expert、EP rank 的 token assignment |
+| K-R-B | TP2/DP4/EP8 + AG+RS | `capture_routed_experts=true` | 记录 TP2/DP4 的专家负载 |
+| K-R-D | TP2/DP4/EP8 + one-sided A2A | `capture_routed_experts=true` | 为 A2A trace 保存匹配的专家负载证据 |
+| K-P-A | TP1/DP8/EP8 + AG+RS | Torch、with-stack | TP1 production trace 基线 |
+| K-P-B | TP2/DP4/EP8 + AG+RS | Torch、with-stack | TP2 AG+RS production trace 基线 |
+| K-P-D | TP2/DP4/EP8 + one-sided A2A | Torch、with-stack | TP2 A2A production trace |
+| K-S-B | TP2/DP4/EP8 + AG+RS | Torch、with-stack、TP sync | 分离到达偏差后的 AG+RS 对照 |
+| K-S-D | TP2/DP4/EP8 + one-sided A2A | Torch、with-stack、TP sync | 分离到达偏差后的 A2A 对照 |
+
+`K-R-*` 只给出路由 assignment 和冷启动 expert 权重字节估算，不提供实测 HBM DRAM
+bytes。`K-S-*` 会主动改变执行时序，只能与相同配置、相同输入的 `K-P-*` 配对比较，不能
+替代 production 基线。TP1 没有 TP all-gather 同步实验。
+
+### 7.2 固定执行顺序
+
+必须依次完成以下阶段；任一阶段失败时停止，不继续采正式 trace。
+
+1. **Qualification：**按 K-Q-A、K-Q-B、K-Q-D 的顺序运行。确认三个 production
+   workload 都能完整执行 prefill 和一次 decode。
+2. **专家负载审计：**按 K-R-A、K-R-B、K-R-D 的顺序运行。审计与 Torch trace 分开，
+   避免 routed-expert D2H copy 污染正式采集。
+3. **Production 基线：**按 K-P-A、K-P-B、K-P-D 的顺序采集。三组必须使用相同
+   warmup、profile iteration、随机种子和 `with_stack=true`。
+4. **TP 同步消融：**只运行 K-S-B 和 K-S-D。除
+   `tp_sync_before_all_gather=true` 外，分别与 K-P-B、K-P-D 完全一致。
+5. **结果汇总：**先在每次 iteration 内对相关 TP ranks 取最大值，再汇总重复运行的
+   中位数。分别报告 prefill/decode、layer、collective、专家负载和峰值显存。
+
+Qualification、专家审计和 trace 完整性各至少成功一次。若要用 K-P/K-S 对照给出 TP
+通信时间结论，两侧必须使用相同次数且各自至少运行五次。
+
+### 7.3 配置与命令映射
+
+| 组 | YAML |
+| --- | --- |
+| A | `shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml` |
+| B | `shapes/prefill_decode_bs32_p4096_tp2_dp4_ag_rs.yaml` |
+| D | `shapes/prefill_decode_bs32_p4096_tp2_dp4_a2a.yaml` |
+
+以下命令模板中的 `<config>`、`<experiment>` 和 `<run-id>` 必须替换为当前实验值。
+
+Qualification：
+
+```bash
+mkdir -p profile_outputs/<experiment>/<run-id>
+
+set -o pipefail
+.venv/bin/torchrun --standalone --nproc-per-node=8 \
+  -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/<config> \
+  --production-profile --profile none \
+  2>&1 | tee profile_outputs/<experiment>/<run-id>/qualification.log
+```
+
+专家负载审计：
+
+```bash
+mkdir -p profile_outputs/<experiment>/<run-id>
+
+set -o pipefail
+.venv/bin/torchrun --standalone --nproc-per-node=8 \
+  -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/<config> \
+  --production-profile --profile none --capture-routed-experts \
+  2>&1 | tee profile_outputs/<experiment>/<run-id>/routing_audit.log
+```
+
+Production Torch trace：
+
+```bash
+mkdir -p profile_outputs/<experiment>/<run-id>/traces
+
+set -o pipefail
+.venv/bin/torchrun --standalone --nproc-per-node=8 \
+  -m benchmarks.kimi_k3_layer_profiling.benchmark \
+  --config benchmarks/kimi_k3_layer_profiling/shapes/<config> \
+  --production-profile --profile torch --profiler-with-stack \
+  --profile-output-dir profile_outputs/<experiment>/<run-id>/traces \
+  2>&1 | tee profile_outputs/<experiment>/<run-id>/torch_profile.log
+```
+
+TP 同步消融使用同一条 Torch 命令，并额外加入：
+
+```text
+--tp-sync-before-all-gather
+```
+
+每次运行还应在相同目录保存当前 `git rev-parse HEAD`、完整命令和退出码。不要复用 trace
+目录，否则不同 rank 或不同重复次数的文件可能混在一起。
 
 ## 8. 验收标准
 
@@ -407,7 +551,8 @@ TP2/DP4；每组在正式采集前单独 qualification。
 
 ### 8.2 Prefill + decode
 
-- prompt 每请求恰好 16384 tokens；
+- global batch 恰好为 32；
+- prompt 每请求恰好 4096 tokens；
 - 每个请求生成 2 个 output tokens；
 - 每个 complete record 的 `profiled_output_token_counts` 全部为 2；
 - `decode_executions_per_request=1`；
@@ -422,7 +567,7 @@ TP2/DP4；每组在正式采集前单独 qualification。
 分位数。
 
 Prefill + decode trace 必须分别统计第一次和第二次 layer execution。整份 trace 的总计
-会被 16K prefill 主导，不能直接代表 decode latency。
+会被 4K prefill 主导，不能直接代表 decode latency。
 
 结果使用 dummy MXFP4 weights 和 uniform-random routing，只代表指定 shape、并行策略、
 backend、production execution stack 和 H20 环境下的性能，不代表真实 checkpoint 的生成
@@ -462,11 +607,15 @@ benchmarks/kimi_k3_layer_profiling/
 ├── benchmark.py
 ├── config.py
 ├── production_profile.py
+├── worker_extension.py
 ├── model_config/
 │   └── config.json
 └── shapes/
     ├── smoke.yaml
     ├── prefill_decode_bs8_p16384_with_stack.yaml
     ├── prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml
-    └── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml
+    ├── prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml
+    ├── prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml
+    ├── prefill_decode_bs32_p4096_tp2_dp4_ag_rs.yaml
+    └── prefill_decode_bs32_p4096_tp2_dp4_a2a.yaml
 ```

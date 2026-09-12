@@ -4,6 +4,7 @@
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,9 @@ from benchmarks.kimi_k3_layer_profiling.config import (
     load_yaml,
 )
 from benchmarks.kimi_k3_layer_profiling.production_profile import (
+    _aggregate_routing_audit,
+    _label_tp_all_gather_measurements,
+    _routing_histograms,
     _validate_output_token_counts,
     production_engine_args_kwargs,
     production_profile_evidence,
@@ -26,6 +30,13 @@ PREFILL_DECODE_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_with_stack.yaml"
 )
+
+
+@pytest.fixture
+def should_do_global_cleanup_after_test() -> bool:
+    return False
+
+
 PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_tp2_dp4_with_stack.yaml"
@@ -33,6 +44,29 @@ PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG = (
 PREFILL_DECODE_TP2_DP4_FLASHINFER_ONE_SIDED_WITH_STACK_CONFIG = (
     ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
     "prefill_decode_bs8_p16384_tp2_dp4_flashinfer_one_sided_with_stack.yaml"
+)
+BS32_CONFIGS = (
+    (
+        ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+        "prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml",
+        1,
+        8,
+        "allgather_reducescatter",
+    ),
+    (
+        ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+        "prefill_decode_bs32_p4096_tp2_dp4_ag_rs.yaml",
+        2,
+        4,
+        "allgather_reducescatter",
+    ),
+    (
+        ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/"
+        "prefill_decode_bs32_p4096_tp2_dp4_a2a.yaml",
+        2,
+        4,
+        "flashinfer_nvlink_one_sided",
+    ),
 )
 
 
@@ -122,6 +156,89 @@ def test_production_profile_uses_the_original_model_and_engine_core() -> None:
     assert "model_class_overrides" not in kwargs
     assert "enable_prompt_embeds" not in kwargs
     assert "profiler_config" not in kwargs
+    assert "worker_extension_cls" not in kwargs
+    assert kwargs["enable_return_routed_experts"] is False
+
+
+def test_tp_sync_ablation_is_opt_in_and_requires_tp() -> None:
+    config = replace(_config(), tp_sync_before_all_gather=True)
+    kwargs = production_engine_args_kwargs(config)
+
+    assert kwargs["worker_extension_cls"].endswith("KimiK3ProfilingWorkerExtension")
+
+    with pytest.raises(ValueError, match="requires tensor_parallel_size > 1"):
+        dry_run(
+            {
+                **load_yaml(PREFILL_DECODE_WITH_STACK_CONFIG),
+                "tp_sync_before_all_gather": True,
+            }
+        )
+
+
+def test_routed_expert_capture_is_separate_from_torch_profile() -> None:
+    config = replace(_config(), capture_routed_experts=True)
+    assert production_engine_args_kwargs(config)["enable_return_routed_experts"]
+
+    with pytest.raises(ValueError, match="audit mode and requires profile=none"):
+        dry_run(
+            {
+                **load_yaml(SMOKE_CONFIG),
+                "capture_routed_experts": True,
+                "profile": "torch",
+                "profile_output_dir": "traces",
+            }
+        )
+
+
+def test_routing_audit_ignores_dense_layer_zero() -> None:
+    import numpy as np
+
+    config = replace(
+        _config(),
+        workload="prefill_decode",
+        batch_size=1,
+        history_len=2,
+        query_len=1,
+        data_parallel_size=1,
+    )
+    routed = np.zeros((3, 12, 16), dtype=np.int32)
+    routed[:, 1:, :] = np.arange(16, dtype=np.int32)
+    outputs = [SimpleNamespace(routed_experts=routed)]
+
+    local = _routing_histograms(outputs, config)
+    assert [layer["layer"] for layer in local["phases"]["prefill"]] == list(
+        range(1, 12)
+    )
+    global_audit = _aggregate_routing_audit(local, config, tp_rank=0)
+    assert global_audit is not None
+    assert global_audit["hbm_bytes_scope"] == "not_measured"
+    assert global_audit["estimated_checkpoint_weight_bytes_per_expert"] > 0
+    assert global_audit["phases"]["decode"][0]["global_assignment_count"] == 16
+
+
+def test_tp_sync_measurements_are_attributed_to_preceding_work() -> None:
+    config = dry_run(load_yaml(PREFILL_DECODE_TP2_DP4_WITH_STACK_CONFIG)).config
+    measurements: list[dict[str, Any]] = [
+        {
+            "global_rank": 0,
+            "calls": [
+                {"call_index": index, "elapsed_ms": 1.0, "input_shape": [1, 1]}
+                for index in range(26)
+            ],
+        }
+    ]
+
+    result = _label_tp_all_gather_measurements(measurements, config)[0]["calls"]
+    assert result[0]["phase"] == "prefill"
+    assert result[0]["arrival_skew_source"] == "input_pipeline"
+    assert result[1]["arrival_skew_source"] == "layers.0.tail"
+    assert result[12]["scope"] == "model.final_sp_all_gather"
+    assert result[13]["phase"] == "decode"
+
+    with pytest.raises(RuntimeError, match="recorded 25 TP all-gathers"):
+        _label_tp_all_gather_measurements(
+            [{"global_rank": 0, "calls": measurements[0]["calls"][:-1]}], config
+        )
 
 
 def test_backend_overrides_reach_production_engine_args() -> None:
@@ -224,6 +341,20 @@ def test_formal_matrix_configs(
     assert config.expert_parallel_size == 8
     assert config.all2all_backend == all2all_backend
     assert config.profiler_with_stack is with_stack
+
+
+@pytest.mark.parametrize(("path", "tp", "dp", "backend"), BS32_CONFIGS)
+def test_bs32_p4096_matrix(path: Path, tp: int, dp: int, backend: str) -> None:
+    config = dry_run(load_yaml(path)).config
+
+    assert config.batch_size == 32
+    assert config.prompt_len == 4096
+    assert config.max_tokens == 2
+    assert config.tensor_parallel_size == tp
+    assert config.data_parallel_size == dp
+    assert config.all2all_backend == backend
+    assert config.capture_routed_experts is False
+    assert config.tp_sync_before_all_gather is False
 
 
 def test_production_evidence_records_current_execution_path() -> None:

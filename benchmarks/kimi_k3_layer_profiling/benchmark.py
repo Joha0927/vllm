@@ -29,6 +29,7 @@ _OVERRIDE_FIELDS = (
     "moe_backend",
     "linear_backend",
     "attention_backend",
+    "capture_routed_experts",
     "kda_prefill_backend",
     "mla_prefill_backend",
     "kv_cache_dtype",
@@ -43,6 +44,7 @@ _OVERRIDE_FIELDS = (
     "profiler_with_stack",
     "gpu_count",
     "random_seed",
+    "tp_sync_before_all_gather",
 )
 
 
@@ -84,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--moe-backend")
     parser.add_argument("--linear-backend")
     parser.add_argument("--attention-backend")
+    parser.add_argument(
+        "--capture-routed-experts",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--kda-prefill-backend", choices=("auto", "triton", "flashkda"))
     parser.add_argument(
         "--mla-prefill-backend",
@@ -115,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--gpu-count", type=int)
     parser.add_argument("--random-seed", type=int)
+    parser.add_argument(
+        "--tp-sync-before-all-gather",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     return parser
 
 

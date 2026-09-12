@@ -23,6 +23,7 @@ _REQUIRED_CONFIG_FIELDS = {
 _CONFIG_DEFAULTS: dict[str, Any] = {
     "all2all_backend": "allgather_reducescatter",
     "attention_backend": "auto",
+    "capture_routed_experts": False,
     "data_parallel_size": 1,
     "decode_context_parallel_size": 1,
     "enable_dbo": False,
@@ -44,6 +45,7 @@ _CONFIG_DEFAULTS: dict[str, Any] = {
     "routing_strategy": "uniform_random",
     "shard_sp_shared_expert": False,
     "tensor_parallel_size": 8,
+    "tp_sync_before_all_gather": False,
     "warmup_iters": 1,
 }
 _CONFIG_FIELDS = _REQUIRED_CONFIG_FIELDS | _CONFIG_DEFAULTS.keys()
@@ -89,6 +91,7 @@ class BenchmarkConfig:
     moe_backend: str
     linear_backend: str
     attention_backend: str
+    capture_routed_experts: bool
     kda_prefill_backend: str
     mla_prefill_backend: str
     kv_cache_dtype: str
@@ -103,6 +106,7 @@ class BenchmarkConfig:
     profiler_with_stack: bool
     gpu_count: int
     random_seed: int
+    tp_sync_before_all_gather: bool
 
     @property
     def num_scheduled_tokens(self) -> int:
@@ -172,6 +176,7 @@ class DryRunResult:
         return {
             "all2all_backend": config.all2all_backend,
             "attention_backend": config.attention_backend,
+            "capture_routed_experts": config.capture_routed_experts,
             "batch_size": config.batch_size,
             "context_lengths": [config.prompt_len] * config.batch_size,
             "data_parallel_size": config.data_parallel_size,
@@ -217,6 +222,7 @@ class DryRunResult:
             "routing_strategy": config.routing_strategy,
             "shard_sp_shared_expert": config.shard_sp_shared_expert,
             "tensor_parallel_size": config.tensor_parallel_size,
+            "tp_sync_before_all_gather": config.tp_sync_before_all_gather,
             "warmup_iters": config.warmup_iters,
             "weight_format": config.weight_format,
             "weight_source": "dummy",
@@ -294,6 +300,9 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
         moe_backend=str(values["moe_backend"]),
         linear_backend=str(values["linear_backend"]),
         attention_backend=str(values["attention_backend"]),
+        capture_routed_experts=_require_bool(
+            values["capture_routed_experts"], "capture_routed_experts"
+        ),
         kda_prefill_backend=str(values["kda_prefill_backend"]),
         mla_prefill_backend=str(values["mla_prefill_backend"]),
         kv_cache_dtype=str(values["kv_cache_dtype"]),
@@ -316,6 +325,9 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
         ),
         gpu_count=int(values["gpu_count"]),
         random_seed=int(values["random_seed"]),
+        tp_sync_before_all_gather=_require_bool(
+            values["tp_sync_before_all_gather"], "tp_sync_before_all_gather"
+        ),
     )
     validate_config(config)
     return config
@@ -366,6 +378,12 @@ def validate_config(config: BenchmarkConfig) -> None:
     if config.tensor_parallel_size * config.data_parallel_size != config.gpu_count:
         raise ValueError(
             "tensor_parallel_size * data_parallel_size must equal gpu_count"
+        )
+    if config.tp_sync_before_all_gather and config.tensor_parallel_size == 1:
+        raise ValueError("tp_sync_before_all_gather requires tensor_parallel_size > 1")
+    if config.capture_routed_experts and config.profile != "none":
+        raise ValueError(
+            "capture_routed_experts is an audit mode and requires profile=none"
         )
     if config.kda_prefill_backend not in _KDA_PREFILL_BACKENDS:
         raise ValueError(
