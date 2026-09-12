@@ -7,6 +7,12 @@
 不能把本结果解释为 MXFP8 性能。
 不使用自定义模型 wrapper，也不手工构造 attention metadata 或 KV cache。
 
+固定模型资产 `model_config/config.json` 来自官方
+[`MiniMaxAI/MiniMax-M3`](https://huggingface.co/MiniMaxAI/MiniMax-M3/blob/main/config.json)
+配置（2026-09-12 核对），并随 benchmark 一起由 Git 管理。运行时只通过
+`hf_overrides` 将 text layer 数截断为 4；配置文件中的其余 text/vision 架构字段保持
+官方值。
+
 前四层覆盖两类结构：
 
 ```text
@@ -20,34 +26,40 @@ Torch Profiler、eager execution、`with_stack=true`。
 
 ## 实验清单
 
-MiniMax M3 当前只执行一组并行策略，不与 Kimi-K3 的 TP/A2A 消融混合：
+MiniMax M3 对比两组 TP/DP 策略；两组都启用 EP8，并固定使用 AG+RS：
 
 | ID | 并行与通信 | 模式 | 目的 |
 | --- | --- | --- | --- |
-| M-Q | TP1/DP8/EP8 + AG+RS | `profile=none` | 验证四层模型、shape、拓扑和 prefill+decode |
-| M-P | TP1/DP8/EP8 + AG+RS | Torch、with-stack | 采集前四层 production trace |
+| M-Q1 | TP1/DP8/EP8 + AG+RS | `profile=none` | 验证 TP1 production workload |
+| M-Q2 | TP2/DP4/EP8 + AG+RS | `profile=none` | 验证 TP2 production workload |
+| M-P1 | TP1/DP8/EP8 + AG+RS | Torch、with-stack | 采集 TP1 前四层 trace |
+| M-P2 | TP2/DP4/EP8 + AG+RS | Torch、with-stack | 采集 TP2 前四层 trace |
 
-固定配置文件为：
+配置映射为：
 
 ```text
-shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml
+M-Q1 / M-P1 -> shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml
+M-Q2 / M-P2 -> shapes/prefill_decode_bs32_p4096_tp2_dp4_ag_rs.yaml
 ```
 
 ## 执行顺序
 
-### 1. Qualification（M-Q）
+### 1. Qualification（M-Q1、M-Q2）
 
-先创建独立结果目录，再运行不开 profiler 的 production workload：
+先运行 M-Q1；通过后将 `CONFIG` 和 `EXPERIMENT` 改为 M-Q2，再执行相同命令。两个
+qualification 必须使用独立目录。
 
 ```bash
+CONFIG=benchmarks/minimax_m3_layer_profiling/shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml
+EXPERIMENT=minimax_m3_m_q1_tp1_dp8
 RUN_ID=$(date +%Y%m%d_%H%M%S)
-RUN_DIR=profile_outputs/minimax_m3_m_q/${RUN_ID}
+RUN_DIR=profile_outputs/${EXPERIMENT}/${RUN_ID}
 mkdir -p "${RUN_DIR}"
 
 set -o pipefail
 .venv/bin/torchrun --standalone --nproc-per-node=8 \
   -m benchmarks.minimax_m3_layer_profiling.benchmark \
-  --config benchmarks/minimax_m3_layer_profiling/shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml \
+  --config "${CONFIG}" \
   --production-profile --profile none \
   2>&1 | tee "${RUN_DIR}/qualification.log"
 
@@ -57,21 +69,24 @@ printf 'git_commit=%s\nqualification_exit_code=%s\n' \
   | tee "${RUN_DIR}/run_meta.txt"
 ```
 
-只有 M-Q 达到后面的验收标准后才能进入 M-P。
+M-Q1 和 M-Q2 都达到后面的验收标准后才能进入正式采集。
 
-### 2. Production Torch trace（M-P）
+### 2. Production Torch trace（M-P1、M-P2）
 
-使用新目录采集正式 trace，不得复用 qualification 目录：
+按 M-P1、M-P2 顺序运行。分别选择与 M-Q1、M-Q2 相同的配置，且不得复用
+qualification 或另一组 trace 的目录。
 
 ```bash
+CONFIG=benchmarks/minimax_m3_layer_profiling/shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml
+EXPERIMENT=minimax_m3_m_p1_tp1_dp8
 RUN_ID=$(date +%Y%m%d_%H%M%S)
-RUN_DIR=profile_outputs/minimax_m3_m_p/${RUN_ID}
+RUN_DIR=profile_outputs/${EXPERIMENT}/${RUN_ID}
 mkdir -p "${RUN_DIR}/traces"
 
 set -o pipefail
 .venv/bin/torchrun --standalone --nproc-per-node=8 \
   -m benchmarks.minimax_m3_layer_profiling.benchmark \
-  --config benchmarks/minimax_m3_layer_profiling/shapes/prefill_decode_bs32_p4096_tp1_dp8_ag_rs.yaml \
+  --config "${CONFIG}" \
   --production-profile --profile torch \
   --profile-output-dir "${RUN_DIR}/traces" \
   2>&1 | tee "${RUN_DIR}/torch_profile.log"
@@ -88,10 +103,12 @@ ranks 的最大值，再报告中位数；不能把各 rank 的 CUDA 时间直�
 
 ## 验收标准
 
-M-Q 要求退出码为 0，8 个 rank 均 `status=PASS`，每请求都生成 2 个 token，且
-`decode_executions_per_request=1`；拓扑必须为 TP1/DP8/EP8，请求必须按 DP rank 正确分片。
+M-Q1 和 M-Q2 均要求退出码为 0，8 个 rank 均 `status=PASS`，每请求都生成 2 个 token，
+且 `decode_executions_per_request=1`。M-Q1 拓扑必须为 TP1/DP8/EP8，每个 DP rank
+处理 4 个请求；M-Q2 必须为 TP2/DP4/EP8，每个 DP rank 处理 8 个请求。同一 TP group
+处理相同请求，request-to-DP 映射不得重复或遗漏。
 
-M-P 除满足 M-Q 的运行条件外，还要求 8 份 trace
+M-P1 和 M-P2 除分别满足对应 qualification 的运行条件外，还要求各自产生 8 份 trace
 非空，均包含 `layers.0..3` 的 prefill 和 decode execution，不包含 `layers.4+`；
 trace 必须包含 CPU operators、CUDA kernels、recorded shapes 和非空 Python stack。
 
