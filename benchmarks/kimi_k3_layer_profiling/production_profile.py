@@ -171,9 +171,16 @@ def _routing_histograms(outputs: list[Any], config: BenchmarkConfig) -> dict[str
     }
     arrays = []
     for request_index, output in enumerate(outputs):
-        routed = output.routed_experts
+        if len(output.outputs) != 1:
+            raise RuntimeError(
+                f"request {request_index} produced {len(output.outputs)} sequences, "
+                "expected exactly 1 when capturing routed experts"
+            )
+        routed = output.outputs[0].routed_experts
         if routed is None:
-            raise RuntimeError(f"request {request_index} has no routed_experts")
+            raise RuntimeError(
+                f"request {request_index} completion has no routed_experts"
+            )
         array = np.asarray(routed)
         expected_shape = (expected_tokens, config.num_layers, topk)
         if array.shape != expected_shape:

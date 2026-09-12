@@ -23,6 +23,7 @@ from benchmarks.kimi_k3_layer_profiling.production_profile import (
     production_profile_evidence,
     validate_production_profile_config,
 )
+from vllm.outputs import CompletionOutput, RequestOutput
 
 ROOT = Path(__file__).parents[2]
 SMOKE_CONFIG = ROOT / "benchmarks/kimi_k3_layer_profiling/shapes/smoke.yaml"
@@ -72,6 +73,28 @@ BS32_CONFIGS = (
 
 def _config():
     return dry_run(load_yaml(SMOKE_CONFIG)).config
+
+
+def _request_output(*routed_experts: Any) -> RequestOutput:
+    completions = [
+        CompletionOutput(
+            index=index,
+            text="",
+            token_ids=[1, 2],
+            cumulative_logprob=None,
+            logprobs=None,
+            routed_experts=routed,
+        )
+        for index, routed in enumerate(routed_experts)
+    ]
+    return RequestOutput(
+        request_id="request-0",
+        prompt=None,
+        prompt_token_ids=None,
+        prompt_logprobs=None,
+        outputs=completions,
+        finished=True,
+    )
 
 
 def test_smoke_config_describes_the_first_real_block() -> None:
@@ -202,8 +225,9 @@ def test_routing_audit_ignores_dense_layer_zero() -> None:
         data_parallel_size=1,
     )
     routed = np.zeros((3, 12, 16), dtype=np.int32)
+    routed[:, 0, :] = -1
     routed[:, 1:, :] = np.arange(16, dtype=np.int32)
-    outputs = [SimpleNamespace(routed_experts=routed)]
+    outputs = [_request_output(routed)]
 
     local = _routing_histograms(outputs, config)
     assert [layer["layer"] for layer in local["phases"]["prefill"]] == list(
@@ -213,7 +237,67 @@ def test_routing_audit_ignores_dense_layer_zero() -> None:
     assert global_audit is not None
     assert global_audit["hbm_bytes_scope"] == "not_measured"
     assert global_audit["estimated_checkpoint_weight_bytes_per_expert"] > 0
+    assert global_audit["phases"]["prefill"][0]["global_assignment_count"] == 32
     assert global_audit["phases"]["decode"][0]["global_assignment_count"] == 16
+
+
+def test_routing_audit_requires_completion_routed_experts() -> None:
+    import numpy as np
+
+    config = replace(
+        _config(),
+        workload="prefill_decode",
+        batch_size=1,
+        history_len=2,
+        query_len=1,
+        data_parallel_size=1,
+    )
+
+    with pytest.raises(
+        RuntimeError, match="request 0 completion has no routed_experts"
+    ):
+        _routing_histograms([_request_output(None)], config)
+
+    wrong_shape = np.zeros((2, 12, 16), dtype=np.int32)
+    with pytest.raises(RuntimeError, match=r"has shape \(2, 12, 16\)"):
+        _routing_histograms([_request_output(wrong_shape)], config)
+
+
+@pytest.mark.parametrize("completion_count", [0, 2])
+def test_routing_audit_requires_exactly_one_completion(
+    completion_count: int,
+) -> None:
+    import numpy as np
+
+    routed = np.zeros((3, 12, 16), dtype=np.int32)
+    output = _request_output(*([routed] * completion_count))
+
+    with pytest.raises(
+        RuntimeError,
+        match=(rf"request 0 produced {completion_count} sequences, expected exactly 1"),
+    ):
+        _routing_histograms([output], replace(_config(), data_parallel_size=1))
+
+
+@pytest.mark.parametrize("invalid_expert_id", [-1, 896])
+def test_routing_audit_rejects_out_of_range_expert_ids(
+    invalid_expert_id: int,
+) -> None:
+    import numpy as np
+
+    config = replace(
+        _config(),
+        workload="prefill_decode",
+        batch_size=1,
+        history_len=2,
+        query_len=1,
+        data_parallel_size=1,
+    )
+    routed = np.zeros((3, 12, 16), dtype=np.int32)
+    routed[0, 1, 0] = invalid_expert_id
+
+    with pytest.raises(RuntimeError, match=r"expert IDs outside \[0, 896\)"):
+        _routing_histograms([_request_output(routed)], config)
 
 
 def test_tp_sync_measurements_are_attributed_to_preceding_work() -> None:

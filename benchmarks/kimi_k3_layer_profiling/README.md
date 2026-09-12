@@ -143,6 +143,12 @@ layer；二者不参与 KDA/MLA 层间对照。
 输出 assignment 数、实际命中的本地专家数与逐专家 histogram。审计模式强制
 `profile=none`，避免 routed-expert buffer、D2H copy 和汇总工作污染正式 Torch trace。
 
+`LLM.generate()` 返回的顶层对象是 `RequestOutput`；路由结果位于唯一 completion 的
+`RequestOutput.outputs[0].routed_experts`，不在 `RequestOutput` 本身。对于当前 P4096、
+`max_tokens=2` 用例，scheduler 先返回完整 prompt 路由，再追加一次 decode 路由，因此每个
+request 的最终 shape 必须是 `[4097, 12, topk]`。completion 数量、数据缺失或 shape 不符
+均应显式失败。
+
 审计输出的 `hbm_bytes_scope` 固定为 `not_measured`。其中
 `cold_unique_expert_weight_bytes_estimate` 只是按 MXFP4 checkpoint 表示计算的“每个命中
 专家从冷内存读取一次”估算，不是上下界。实际 HBM DRAM bytes 受 L2、kernel tiling、
