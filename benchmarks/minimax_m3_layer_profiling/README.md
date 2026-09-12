@@ -24,6 +24,13 @@ layer.3     = sparse attention + routed MoE/shared expert
 因此同一次运行包含完整 prefill 和一次 single-token decode。正式 trace 使用
 Torch Profiler、eager execution、`with_stack=true`。
 
+两套 YAML 都显式设置 `block_size=128`。MiniMax M3 Indexer 和 Sparse Attention
+production backend 的 kernel block size 固定为 128，而普通 FlashAttention 支持 16 的
+倍数，因此 128 是三者的共同值。若省略该输入，通用 backend 选择会先看到前置 full
+attention layer 并保留默认 KV manager block size 16，随后在混合 backend cache group
+初始化时报 `No common block size for 16`。这里不能修改模型的
+`sparse_attention_config.sparse_block_size`，也不能把它降为 16。
+
 ## 实验清单
 
 MiniMax M3 对比两组 TP/DP 策略；两组都启用 EP8，并固定使用 AG+RS：
@@ -97,14 +104,21 @@ printf 'git_commit=%s\nprofile_exit_code=%s\n' \
   | tee "${RUN_DIR}/run_meta.txt"
 ```
 
-YAML 已固定 `profiler_with_stack=true`、`warmup_iters=3` 和 `profile_iters=1`。若要对
-MiniMax M3 时延作正式统计，应使用相同配置独立运行至少五次，逐 iteration 先取 8 个 EP
-ranks 的最大值，再报告中位数；不能把各 rank 的 CUDA 时间直接相加。
+YAML 已固定 `profiler_with_stack=true`、`warmup_iters=3` 和 `profile_iters=1`。with-stack
+trace 只用于分析算子、kernel、调用栈和通信归因，不用于报告正式端到端时延；stack
+采集会扰动 CPU 调度和运行开销。
+
+若要测正式时延，应保持相同模型、shape、TP/DP/EP 和通信 backend，但使用
+`profile=none` 的独立运行，并在统一同步边界下至少重复五次。每个 iteration 先取 8 个
+EP ranks 的最大值，再报告中位数；不能把各 rank 的时间直接相加。当前脚本没有输出满足
+该定义的正式 latency 指标，因此 qualification 日志和 Torch trace 都不得解释为正式时延。
 
 ## 验收标准
 
-M-Q1 和 M-Q2 均要求退出码为 0，8 个 rank 均 `status=PASS`，每请求都生成 2 个 token，
-且 `decode_executions_per_request=1`。M-Q1 拓扑必须为 TP1/DP8/EP8，每个 DP rank
+M-Q1 和 M-Q2 均要求退出码为 0，8 个 rank 均先输出 `stage=ready`，随后输出
+`status=PASS`；ready 和 complete 记录中的 `resolved_kv_manager_block_size` 必须都为
+128。每请求都必须生成 2 个 token，且 `decode_executions_per_request=1`。M-Q1 拓扑必须为
+TP1/DP8/EP8，每个 DP rank
 处理 4 个请求；M-Q2 必须为 TP2/DP4/EP8，每个 DP rank 处理 8 个请求。同一 TP group
 处理相同请求，request-to-DP 映射不得重复或遗漏。
 
@@ -115,3 +129,7 @@ trace 必须包含 CPU operators、CUDA kernels、recorded shapes 和非空 Pyth
 两阶段均不得出现 OOM、CUDA、NCCL、worker 或 KV-cache failure，退出后 GPU 显存必须
 释放。MiniMax M3 结果只代表 dummy BF16 权重、当前 commit、固定 shape 和当前 backend，
 不能解释成真实 checkpoint 的输出质量或 MXFP8 性能。
+
+qualification 日志还必须确认 `resolved_kv_manager_block_size=128`，且不再出现
+`No common block size`。该值属于本 benchmark 对当前 MiniMax M3 production backend
+组合的显式运行条件，不代表所有 vLLM 模型都应使用 128-token KV block。

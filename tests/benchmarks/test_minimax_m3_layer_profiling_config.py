@@ -4,6 +4,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +14,10 @@ from benchmarks.minimax_m3_layer_profiling.config import (
     manifest,
     parse_config,
 )
-from benchmarks.minimax_m3_layer_profiling.production_profile import engine_kwargs
+from benchmarks.minimax_m3_layer_profiling.production_profile import (
+    _validate_resolved_block_size,
+    engine_kwargs,
+)
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
 ROOT = Path(__file__).parents[2]
@@ -44,6 +48,7 @@ def test_first_four_layers_cover_dense_and_sparse_moe(
     assert config.tensor_parallel_size == tp
     assert config.data_parallel_size == dp
     assert config.expert_parallel_size == 8
+    assert config.block_size == 128
     assert result["expected_layer_range"] == [0, 3]
     assert result["layer_types"] == [
         {"layer": 0, "attention": "full", "ffn": "dense"},
@@ -86,12 +91,38 @@ def test_production_args_keep_real_model_path_and_cut_only_layer_count(
     assert kwargs["hf_overrides"] == {"text_config": {"num_hidden_layers": 4}}
     assert kwargs["language_model_only"] is True
     assert kwargs["load_format"] == "dummy"
+    assert kwargs["block_size"] == 128
     assert kwargs["tensor_parallel_size"] == tp
     assert kwargs["data_parallel_size"] == dp
     assert kwargs["max_num_seqs"] == 32 // dp
     assert kwargs["max_num_batched_tokens"] == (32 // dp) * 4096
     assert kwargs["max_model_len"] == 4098
     assert "profiler_config" not in kwargs
+
+
+def test_manager_block_size_matches_sparse_kernel_block_size() -> None:
+    data = load_yaml(TP1_CONFIG)
+    data["block_size"] = 16
+
+    with pytest.raises(
+        ValueError,
+        match="block_size must equal MiniMax M3 sparse_block_size \\(128\\)",
+    ):
+        parse_config(data)
+
+
+def test_resolved_manager_block_size_is_checked_after_engine_init() -> None:
+    def fake_llm(block_size: int) -> SimpleNamespace:
+        cache_config = SimpleNamespace(block_size=block_size)
+        vllm_config = SimpleNamespace(cache_config=cache_config)
+        return SimpleNamespace(llm_engine=SimpleNamespace(vllm_config=vllm_config))
+
+    assert _validate_resolved_block_size(fake_llm(128), 128) == 128
+    with pytest.raises(
+        RuntimeError,
+        match="expected resolved KV manager block size 128, got 16",
+    ):
+        _validate_resolved_block_size(fake_llm(16), 128)
 
 
 @pytest.mark.parametrize(("path", "_tp", "_dp"), CONFIGS)

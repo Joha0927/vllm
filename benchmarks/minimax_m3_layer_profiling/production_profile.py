@@ -12,6 +12,7 @@ from benchmarks.minimax_m3_layer_profiling.config import BenchmarkConfig, manife
 def engine_kwargs(config: BenchmarkConfig) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "all2all_backend": config.all2all_backend,
+        "block_size": config.block_size,
         "data_parallel_size": config.data_parallel_size,
         "disable_log_stats": True,
         "dtype": "bfloat16",
@@ -61,6 +62,15 @@ def _validate_outputs(outputs: list[Any], expected_requests: int) -> list[int]:
     return counts
 
 
+def _validate_resolved_block_size(llm: Any, expected: int) -> int:
+    resolved = llm.llm_engine.vllm_config.cache_config.block_size
+    if resolved != expected:
+        raise RuntimeError(
+            f"expected resolved KV manager block size {expected}, got {resolved}"
+        )
+    return resolved
+
+
 def run(config: BenchmarkConfig) -> None:
     if config.data_parallel_size > 1:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -82,6 +92,7 @@ def run(config: BenchmarkConfig) -> None:
     evidence = manifest(config)
     print(json.dumps({**evidence, "stage": "initializing"}, sort_keys=True))
     llm = LLM.from_engine_args(EngineArgs(**engine_kwargs(config)))
+    resolved_block_size = _validate_resolved_block_size(llm, config.block_size)
     dp_rank = llm.llm_engine.vllm_config.parallel_config.data_parallel_rank
     if dp_rank is None:
         raise RuntimeError("production engine did not resolve data_parallel_rank")
@@ -106,6 +117,15 @@ def run(config: BenchmarkConfig) -> None:
             "tensor_parallel_rank": None,
             "world_size": None,
         }
+    runtime_evidence = {
+        **rank_evidence,
+        "data_parallel_rank": dp_rank,
+        "global_request_indices": list(range(start, end)),
+        "resolved_kv_manager_block_size": resolved_block_size,
+    }
+    print(
+        json.dumps({**evidence, **runtime_evidence, "stage": "ready"}, sort_keys=True)
+    )
     sampling = SamplingParams(
         detokenize=False,
         ignore_eos=True,
@@ -136,9 +156,7 @@ def run(config: BenchmarkConfig) -> None:
         json.dumps(
             {
                 **evidence,
-                **rank_evidence,
-                "data_parallel_rank": dp_rank,
-                "global_request_indices": list(range(start, end)),
+                **runtime_evidence,
                 "profiled_output_token_counts": counts,
                 "decode_executions_per_request": 1,
                 "stage": "complete",

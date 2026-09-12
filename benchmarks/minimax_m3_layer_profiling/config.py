@@ -21,6 +21,7 @@ class BenchmarkConfig:
     data_parallel_size: int
     enable_expert_parallel: bool
     all2all_backend: str
+    block_size: int
     kv_cache_memory_bytes: int
     warmup_iters: int
     profile_iters: int
@@ -74,6 +75,7 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
         raise ValueError(f"missing required fields: {', '.join(missing)}")
     defaults = {
         "all2all_backend": "allgather_reducescatter",
+        "block_size": 128,
         "data_parallel_size": 8,
         "enable_expert_parallel": True,
         "gpu_count": 8,
@@ -100,6 +102,7 @@ def parse_config(data: dict[str, Any]) -> BenchmarkConfig:
             values["enable_expert_parallel"], "enable_expert_parallel"
         ),
         all2all_backend=str(values["all2all_backend"]),
+        block_size=int(values["block_size"]),
         kv_cache_memory_bytes=int(values["kv_cache_memory_bytes"]),
         warmup_iters=int(values["warmup_iters"]),
         profile_iters=int(values["profile_iters"]),
@@ -126,6 +129,7 @@ def validate_config(config: BenchmarkConfig) -> None:
         "tensor_parallel_size",
         "data_parallel_size",
         "gpu_count",
+        "block_size",
         "kv_cache_memory_bytes",
         "profile_iters",
     ):
@@ -152,6 +156,12 @@ def validate_config(config: BenchmarkConfig) -> None:
     if not config.all2all_backend:
         raise ValueError("all2all_backend must be non-empty")
     text_config = load_text_config()
+    sparse_block_size = int(text_config["sparse_attention_config"]["sparse_block_size"])
+    if config.block_size != sparse_block_size:
+        raise ValueError(
+            f"block_size must equal MiniMax M3 sparse_block_size "
+            f"({sparse_block_size}), got {config.block_size}"
+        )
     num_experts = int(text_config["num_local_experts"])
     if config.enable_expert_parallel and num_experts % config.expert_parallel_size:
         raise ValueError("num_local_experts must be divisible by expert_parallel_size")
